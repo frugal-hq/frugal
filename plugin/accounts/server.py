@@ -32,7 +32,7 @@ LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|quota|to
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
 AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oauth token (has )?(expired|been revoked)"
                   r"|invalid (api|x-api) key|authentication_error|not authenticated|login required", re.I)
-HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|\b(pytest|jest|vitest|tsc|gradlew?|mvn|bench\.py)\b"
+HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|\b(pytest|jest|vitest|tsc|gradlew?|mvn)\b|\bpython\S*\s+\S*bench\.py\b"
                        r"|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b", re.I)
 CODEX_RULES = (
     "Work rules: report results, not process; no filler, preamble or closing summary. Keep exact terms, code, commands, errors, "
@@ -181,11 +181,51 @@ def run_cli(argv, prompt, cwd, env):
     return r[0], r[1].strip(), r[2].strip()
 
 
+def bash():
+    # shell=True would mean cmd.exe on Windows, which fails on bash syntax; System32's bash.exe is WSL, another machine.
+    found = shutil.which("bash")
+    if os.name != "nt":
+        return found or shutil.which("sh")
+    git = [os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
+           os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "bin", "bash.exe")]
+    return next((p for p in [found, *git] if p and os.path.isfile(p) and "system32" not in p.lower()), None)
+
+
 def run_check(check, cwd):
-    r = run_tree(check, 300, shell=True, cwd=cwd)
+    sh = bash()
+    if not sh:
+        return 127, "bash not found; on Windows it comes with Git for Windows"
+    r = run_tree([sh, "-c", check], 300, cwd=cwd)
     if r is None:
         return 124, "check timed out after 5 minutes"
-    return r[0], (r[1] + r[2])[-400:]
+    return r[0], (r[1] + r[2]).strip()
+
+
+# The command could not run on this machine (missing tool, no permission, timeout); the code was never tested.
+ENV_FAIL = re.compile(r"command not found|is not recognized as an internal|permission denied while trying to connect to the docker"
+                      r"|cannot connect to the docker daemon|docker daemon is not running", re.I)
+
+
+def env_failure(code, out):
+    return code in (124, 126, 127) or (code != 0 and bool(ENV_FAIL.search(out)))
+
+
+def do_here(check, code, out):
+    return (f"frugal: check `{check}` exited {code} and could not run here:\n{out[-800:]}\n"
+            "Do it here: run the same command again in your shell and it goes through.")
+
+
+def run_brief(text, check, level, effort, cwd):
+    # The check runs once, here; its exit code and output are the result. An agent only explains a failure, from that output.
+    code, out = run_check(check, cwd)
+    if env_failure(code, out):
+        return do_here(check, code, out)
+    if code == 0:
+        return f"frugal: check `{check}` exited 0, passed:\n{out[-300:]}"
+    notes = brief(f"{text}\n\nThe command `{check}` already ran and exited {code}. The end of its output:\n{out[-8000:]}\n\n"
+                  "Find the cause of each failure from this output and the code. Do not run the command again.",
+                  "search", None, level, effort, cwd)
+    return f"frugal: check `{check}` exited {code}, failed:\n{out[-800:]}\n\nAgent notes, not a test result:\n{notes}"
 
 
 BUSY = {}
@@ -196,8 +236,12 @@ def relogin(ids):
 
 
 def brief(text, kind, check, level, effort, cwd):
+    if check and kind == "run":
+        return run_brief(text, check, level, effort, cwd)
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
     failure, tried, relog = "", [], []
+    if check:
+        text += f"\n\nDone when this bash command exits 0: {check}"
     for n in range(1, MAX_TRIES + 1):
         with LOCK:
             data = load()
@@ -242,14 +286,15 @@ def brief(text, kind, check, level, effort, cwd):
             continue
         if check:
             c, tail = run_check(check, cwd)
-            if c != 0 and kind == "run":
-                return f"{notice}Run by {label}; check `{check}` exited {c}:\n{tail}\n\n{out[:2000]}"
+            if env_failure(c, tail):
+                return f"{notice}{do_here(check, c, tail)}\n\nChanges by {label}, untested:\n{out[:2000]}"
             if c != 0:
-                failure = f"check `{check}` failed: {tail}"
+                failure = f"check `{check}` failed: {tail[-400:]}"
                 continue
+            return f"{notice}Done by {label}; check `{check}` exited 0, passed:\n{tail[-300:]}\n\nAgent notes:\n{out[:2000]}"
         if raw:
             return out
-        return f"{notice}Done by {label}{', check passed' if check else ''}.\n{out[:2000]}"
+        return f"{notice}Done by {label}.\n{out[:2000]}"
     if raw:
         return ""
     return f"{relogin(relog)}frugal: no secondary account finished this{f' ({failure})' if failure else ''}. Do it here."
@@ -264,7 +309,7 @@ SPEC = {
         "task": {"type": "string", "description": "Goal, exact paths, done-when."},
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
-        "check": {"type": "string", "description": "Shell command that exits 0 when done right."},
+        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once."},
         "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the session's project dir."},
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
@@ -360,6 +405,12 @@ def rule(event):
     return f"frugal: delegate bounded work to {ids}; keep here only design and the final check."
 
 
+def heavy(cmd):
+    head = re.split(r"<<-?\s*['\"]?\w+", cmd)[0]  # a heredoc body is data, not a command run here
+    # ssh runs on another machine and may change it there or prompt for a key; CLAUDE_CONFIG_DIR= already uses another account
+    return bool(HEAVY_RUN.search(head)) and not re.search(r"\bssh\s", head) and "CLAUDE_CONFIG_DIR=" not in head
+
+
 def gate(event):
     """The reason to send this tool call to delegate, or None to let it run."""
     if not active() or event.get("agent_id"):
@@ -369,11 +420,11 @@ def gate(event):
     reason = None
     if tool in ("Bash", "PowerShell"):
         cmd = inp.get("command", "")
-        head = re.split(r"<<-?\s*['\"]?\w+", cmd)[0]  # a heredoc body is data, not a command run here
-        if HEAVY_RUN.search(head) and "CLAUDE_CONFIG_DIR=" not in head and cmd not in s.get("waived", []):
+        if heavy(cmd) and cmd not in s.get("waived", []):
             s["waived"] = [*s.get("waived", []), cmd][-20:]
-            reason = (f"frugal: a secondary account runs this, not the main one. Call {TOOL} with kind \"run\", the command as \"check\" "
-                      "and a brief asking for the failures. If it answers \"do it here\", run the same command again and it goes through.")
+            reason = (f"frugal: send this to {TOOL} with kind \"run\", the exact command as \"check\" and a brief asking for the failures; "
+                      "it runs the command once in bash and returns its real exit code and output. If it says \"Do it here\", "
+                      "run the same command again and it goes through.")
     elif tool in ("Read", "Grep", "Glob"):
         s["reads"] = s.get("reads", 0) + 1
         if s["reads"] == EXPLORE_BUDGET + 1:
@@ -557,7 +608,29 @@ def selftest():
     os.utime(old, (0, 0))
     prune()
     assert not old.exists()
-    assert HEAVY_RUN.search("cd x && npm test") and not HEAVY_RUN.search(re.split(r"<<-?\s*['\"]?\w+", "python - <<'EOF'\nnpm test\nEOF")[0])
+    assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
+    assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
+    # delegate's check, with a stub agent that always claims success
+    prompts, g = [], globals()
+    real = {k: g[k] for k in ("run_cli", "load", "save")}
+    g.update(run_cli=lambda argv, prompt, cwd, env: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
+             load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None)
+    try:
+        r = brief("run the tests", "run", "MSYS_NO_PATHCONV=1 echo ran-$((1+1))", None, None, ".")  # case 1: bash syntax cmd.exe rejects
+        assert r.startswith("frugal: check") and "exited 0, passed" in r and "ran-2" in r and not prompts, r
+        r = brief("fix x", "edit", "echo ok", None, None, ".")  # case 2: the agent gets the check
+        assert "echo ok" in prompts[-1] and "exited 0, passed" in r, r
+        r = brief("run the tests", "run", "echo boom; exit 1", None, None, ".")  # case 3: the agent's PASS never becomes the result
+        head, _, notes = r.partition("Agent notes")
+        assert "exited 1, failed" in head and "boom" in head and "PASS" not in head and "PASS" in notes, r
+        assert "exit 1" in prompts[-1] and "boom" in prompts[-1]
+        n = len(prompts)
+        r = brief("run the tests", "run", "no-such-command-frugal", None, None, ".")  # missing tool: do it here, no agent
+        assert "exited 127" in r and "Do it here" in r and len(prompts) == n, r
+        r = brief("fix x", "edit", "echo nope; exit 1", None, None, ".")  # a failing check never reads as passed
+        assert "passed" not in r and "Do it here" in r, r
+    finally:
+        g.update(real)
     return "selftest ok"
 
 

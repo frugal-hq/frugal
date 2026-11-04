@@ -85,7 +85,7 @@ export const DELEGATE_SPEC = {
       task: { type: 'string', description: 'Goal, exact paths, done-when.' },
       tasks: { type: 'array', items: { type: 'string' }, description: 'Independent briefs, run in parallel.' },
       kind: { type: 'string', enum: ['search', 'edit', 'run'], description: 'search: read-only. edit: changes files. run: runs commands and reports.' },
-      check: { type: 'string', description: 'Shell command that exits 0 when done right.' },
+      check: { type: 'string', description: 'Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once.' },
       level: { type: 'string', enum: ['light', 'standard', 'heavy', 'max'], description: 'light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed.' },
       effort: { type: 'string', enum: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'], description: 'Overrides the effort of the level.' },
     },
@@ -162,17 +162,17 @@ const run = async ($: EngineInterface, a: Account, kind: Kind, prompt: string, c
 }
 
 // Test, build and lint runs fill this session's context; while an account is connected they go to delegate.
-const HEAVY_RUN = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|\b(pytest|jest|vitest|tsc|gradlew?|mvn|bench\.py)\b|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b/i
+const HEAVY_RUN = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|\b(pytest|jest|vitest|tsc|gradlew?|mvn)\b|\bpython\S*\s+\S*bench\.py\b|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b/i
 // A command delegate already refused once goes through when asked again ("do it here").
 const waived = new Set<string>()
 
 const gateRun = async ($: EngineInterface, command: string) => {
   // A heredoc body is data (a script, a test file), not a command this session runs.
   const head = command.split(/<<-?\s*['"]?\w+/)[0]!
-  // CLAUDE_CONFIG_DIR= already sends the run to another account.
-  if (!HEAVY_RUN.test(head) || /\bCLAUDE_CONFIG_DIR=/.test(head) || waived.has(command) || !(await connected($, 'run'))) return undefined
+  // CLAUDE_CONFIG_DIR= already sends the run to another account; ssh runs on another machine and may change it or prompt for a key.
+  if (!HEAVY_RUN.test(head) || /\bCLAUDE_CONFIG_DIR=/.test(head) || /\bssh\s/.test(head) || waived.has(command) || !(await connected($, 'run'))) return undefined
   waived.add(command)
-  return `frugal-mod: a secondary account runs this, not the main one. Call ${DELEGATE_TOOL} with kind "run" and a brief like "Run \`${command.slice(0, 200)}\` and report the pass and fail counts and each failure with its message." If it answers "do it here", run the same command again and it goes through.`
+  return `frugal-mod: send this to ${DELEGATE_TOOL} with kind "run", the exact command as "check" and a brief asking for the failures; it runs the command once in bash and returns its real exit code and output. If it says "Do it here", run the same command again and it goes through.`
 }
 
 const connected = async ($: EngineInterface, kind: Kind) =>
@@ -226,10 +226,44 @@ const ask = async ($: EngineInterface, module: string, kind: Kind, prompt: strin
   }
 }
 
+// The engine runs no shell and cmd.exe fails on bash syntax, so Windows checks run in Git Bash (System32's bash.exe is WSL).
+const runCheck = async ($: EngineInterface, check: string, cwd: string) => {
+  const bash = (await $.env.get('OS')) === 'Windows_NT' ? `${(await $.env.get('ProgramFiles')) ?? 'C:\\Program Files'}\\Git\\bin\\bash.exe` : 'bash'
+  try {
+    const c = await $.process.run([bash, '-c', check], { cwd, timeoutMs: 5 * 60_000 })
+    return { code: c.exitCode, out: `${c.stdout}${c.stderr}`.trim() }
+  } catch (err) {
+    return { code: 127, out: `the check did not start or did not finish in 5 minutes: ${String(err)}` }
+  }
+}
+
+// The command could not run on this machine (missing tool, no permission, timeout); the code was never tested.
+const ENV_FAIL = /command not found|is not recognized as an internal|permission denied while trying to connect to the docker|cannot connect to the docker daemon|docker daemon is not running/i
+const envFailure = (code: number, out: string) => [124, 126, 127].includes(code) || (code !== 0 && ENV_FAIL.test(out))
+const doHere = (check: string, code: number, out: string) =>
+  `frugal-mod: check \`${check}\` exited ${code} and could not run here:\n${out.slice(-800)}\nDo it here: run the same command again in your shell and it goes through.`
+
 // One brief through the ladder: run, its check, the inspector for edits, up to MAX_TRIES accounts.
+// A run's check runs once, here, first; its exit code and output are the result, and an agent only explains a failure.
 const runBrief = async ($: EngineInterface, id: string, brief: string, kind: Kind, check: string | undefined, cwd: string, verify: boolean, pick: Pick) => {
   await update($, tasks, list => [...list, { id, title: brief.split('\n')[0]!.slice(0, 60), account: '', model: '', status: 'running' as TaskStatus, tries: 0 }].slice(-20))
-  let failure = ''
+  let header = ''
+  if (check && kind === 'run') {
+    await setTask($, id, { status: 'checking' })
+    const c = await runCheck($, check, cwd)
+    if (envFailure(c.code, c.out) || c.code === 0) {
+      await setTask($, id, { status: c.code === 0 ? 'accepted' : 'escalated' })
+      return c.code === 0 ? `frugal-mod: check \`${check}\` exited 0, passed:\n${c.out.slice(-300)}` : doHere(check, c.code, c.out)
+    }
+    header = `frugal-mod: check \`${check}\` exited ${c.code}, failed:\n${c.out.slice(-800)}\n\nAgent notes, not a test result:\n`
+    brief = `${brief}\n\nThe command \`${check}\` already ran and exited ${c.code}. The end of its output:\n${c.out.slice(-8000)}\n\n` +
+      'Find the cause of each failure from this output and the code. Do not run the command again.'
+    kind = 'search'
+    check = undefined
+  } else if (check) {
+    brief = `${brief}\n\nDone when this bash command exits 0: ${check}`
+  }
+  let failure = '', passed = ''
   const tried: string[] = []
   for (let n = 1; n <= MAX_TRIES; n++) {
     const diff = failure && kind === 'edit' ? (await $.process.run(['git', 'diff', '--stat'], { cwd })).stdout : ''
@@ -241,19 +275,17 @@ const runBrief = async ($: EngineInterface, id: string, brief: string, kind: Kin
     if (!r.ok) { failure = r.text.slice(-400); continue }
     if (check) {
       await setTask($, id, { status: 'checking' })
-      // The engine finds no sh on Windows; cmd runs the check there.
-      const shell = (await $.env.get('OS')) === 'Windows_NT' ? ['cmd', '/c', check] : ['sh', '-c', check]
-      const c = await $.process.run(shell, { cwd, timeoutMs: 5 * 60_000 })
-      // A run reports what failed; trying it on another account would fail the same way.
-      if (c.exitCode !== 0 && kind === 'run') {
-        await setTask($, id, { status: 'accepted' })
-        return `Run by ${r.account.id} (${modelFor(r.account, kind, pick)}); check \`${check}\` exited ${c.exitCode}.\n${r.text.slice(0, 2000)}`
+      const c = await runCheck($, check, cwd)
+      if (envFailure(c.code, c.out)) {
+        await setTask($, id, { status: 'escalated' })
+        return `${doHere(check, c.code, c.out)}\n\nChanges by ${r.account.id}, untested:\n${r.text.slice(0, 2000)}`
       }
-      if (c.exitCode !== 0) {
-        failure = `check \`${check}\` failed: ${(c.stdout + c.stderr).slice(-400)}`
+      if (c.code !== 0) {
+        failure = `check \`${check}\` failed: ${c.out.slice(-400)}`
         await setTask($, id, { status: 'retrying' })
         continue
       }
+      passed = c.out.slice(-300)
     }
     if (verify && kind === 'edit') {
       await setTask($, id, { status: 'inspecting' })
@@ -265,10 +297,11 @@ const runBrief = async ($: EngineInterface, id: string, brief: string, kind: Kin
       }
     }
     await setTask($, id, { status: 'accepted' })
-    return `Done by ${r.account.id} (${modelFor(r.account, kind, pick)})${check ? ', check passed' : ''}.\n${r.text.slice(0, 2000)}`
+    const done = `Done by ${r.account.id} (${modelFor(r.account, kind, pick)})`
+    return `${header}${check ? `${done}; check \`${check}\` exited 0, passed:\n${passed}\n\nAgent notes:` : `${done}.`}\n${r.text.slice(0, 2000)}`
   }
   await setTask($, id, { status: 'escalated' })
-  return `frugal-mod: no secondary account finished this${failure ? ` (${failure})` : ''}. Do it here.`
+  return `${header}frugal-mod: no secondary account finished this${failure ? ` (${failure})` : ''}. Do it here.`
 }
 
 export const registerDelegate = (on: On) => {

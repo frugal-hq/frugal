@@ -12,9 +12,9 @@ const acc = (id: string, patch: Partial<Account> = {}): Account =>
 const ok = (stdout: string) => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
 const fail = (stderr: string) => ({ exitCode: 1, stdout: '', stderr, isStdoutTruncated: false, isStderrTruncated: false })
 
-type Run = (argv: readonly string[], env: Record<string, string>) => ReturnType<typeof ok>
+type Run = (argv: readonly string[], env: Record<string, string>, stdin?: string) => ReturnType<typeof ok>
 
-const engine = (on: On, runs: Run, store: Record<string, unknown>) => {
+const engine = (on: On, runs: Run, store: Record<string, unknown>, vars: Record<string, string> = {}) => {
   on('store.get', (_, e) => ({ value: store[e.key] }))
   on('store.set', (_, e) => { store[e.key] = e.value; return { value: undefined } })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -24,10 +24,11 @@ const engine = (on: On, runs: Run, store: Record<string, unknown>) => {
   on('mcp.call', () => ({ value: { content: [], isError: true } }))
   on('clock.now', () => ({ value: NOW }))
   on('clock.every', () => ({ value: (() => undefined) as never }))
-  on('env.get', () => ({ value: undefined }))
+  on('env.get', (_, e) => ({ value: vars[e.name] }))
   on('session.cwd', () => ({ value: '/repo' }))
-  on('process.run', (_, e) => ({ value: runs(e.argv, e.init?.env ?? {}) }))
+  on('process.run', (_, e) => ({ value: runs(e.argv, e.init?.env ?? {}, e.init?.stdin as string | undefined) }))
 }
+const isCheck = (argv: readonly string[]) => argv[0] === 'bash' || argv[0]!.endsWith('bash.exe')
 
 test('the least used account goes first; capped, limited, disabled and HTTP-only accounts are skipped for edits', () => {
   const list = [
@@ -67,11 +68,52 @@ test('an account at its limit is marked and the next one takes the task', async 
 
 test('a failing check retries elsewhere, then hands the task back', async ($, on) => {
   const store: Record<string, unknown> = { accounts: [acc('a'), acc('b')] }
-  engine(on, argv => argv[0] === 'sh' ? fail('1 test failed') : ok('edited a.ts'), store)
+  engine(on, argv => isCheck(argv) ? fail('1 test failed') : ok('edited a.ts'), store)
   await $.session.start(START)
   const r = await $.tool.call({ tool: 'mcp__frugal-mod__delegate', task: 'fix the off-by-one', kind: 'edit', check: 'npm test' })
   expect(r.text).toContain('Do it here')
   expect(r.text).toContain('npm test')
+  expect(r.text).not.toContain('passed')
+})
+
+test('on Windows a run checks once in Git Bash, not cmd; a pass needs no agent', async ($, on) => {
+  const store: Record<string, unknown> = { accounts: [acc('a')] }
+  const argvs: (readonly string[])[] = []
+  engine(on, argv => { argvs.push(argv); return isCheck(argv) ? ok('ok 12 tests') : ok('PASS') }, store, { OS: 'Windows_NT', ProgramFiles: 'C:\\Program Files' })
+  await $.session.start(START)
+  const check = 'MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W)":/src golang go test ./...'
+  const r = await $.tool.call({ tool: 'mcp__frugal-mod__delegate', task: 'run the tests', kind: 'run', check })
+  expect(argvs).toEqual([['C:\\Program Files\\Git\\bin\\bash.exe', '-c', check]])
+  expect(r.text).toContain('exited 0, passed')
+  expect(r.text).toContain('ok 12 tests')
+})
+
+test('a failing run is its exit code and output; the agent only explains it, from that output', async ($, on) => {
+  const store: Record<string, unknown> = { accounts: [acc('a')] }
+  const prompts: string[] = []
+  engine(on, (argv, _, stdin) => isCheck(argv) ? fail('boom') : (prompts.push(stdin ?? ''), ok('PASS: check-web.sh exited 0')), store)
+  await $.session.start(START)
+  const r = await $.tool.call({ tool: 'mcp__frugal-mod__delegate', task: 'run the tests', kind: 'run', check: 'go test ./...' })
+  const [head, notes] = r.text.split('Agent notes')
+  expect(head).toContain('exited 1, failed')
+  expect(head).toContain('boom')
+  expect(head).not.toContain('PASS')
+  expect(notes).toContain('PASS')
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('boom')
+  expect(prompts[0]).toContain('Do not run the command again')
+})
+
+test('the agent gets the check; a check that cannot run hands the task back as do it here', async ($, on) => {
+  const store: Record<string, unknown> = { accounts: [acc('a')] }
+  const prompts: string[] = []
+  engine(on, (argv, _, stdin) => isCheck(argv) ? { ...fail('bash: go: command not found'), exitCode: 127 } : (prompts.push(stdin ?? ''), ok('edited a.ts')), store)
+  await $.session.start(START)
+  const r = await $.tool.call({ tool: 'mcp__frugal-mod__delegate', task: 'fix the parser', kind: 'edit', check: 'go test ./...' })
+  expect(prompts[0]).toContain('Done when this bash command exits 0: go test ./...')
+  expect(r.text).toContain('exited 127')
+  expect(r.text).toContain('Do it here')
+  expect(r.text).not.toContain('passed')
 })
 
 test('the inspector can reject an edit that passed its check', async ($, on) => {
