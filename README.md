@@ -95,6 +95,7 @@ Add and login verify the signed-in email before an account joins the pool. From 
 - The `delegate` tool runs each brief on the least-used account, in parallel for independent pieces, and moves to the next account when one hits its limit.
 - Each provider gets its own model and effort per level: Claude `haiku`/`sonnet`/`opus` with low to max effort, Codex `gpt-6-luna`/`gpt-6.1-sol`/`gpt-6-astra` (only models the login lists) with low to xhigh, Grok `grok-4.6` with low to xhigh, OpenCode the account's one model. Work defaults to the standard level (`sonnet`, medium).
 - A hook adds the delegation rule to the first prompt, and to a later one only when the prompt before it ran more than 3 reads or searches here and delegated nothing. Another sends test and build runs, a fourth read or search in one prompt (shell commands that only read, such as `cat`, `grep` or `git log`, count too), and subagents to `delegate` once; asking again runs them here.
+- Each delegated run gets 10 minutes, 20 at the heavy level and 30 at max.
 - A logged-out account leaves the pool, and each prompt names the command to sign it in again (`/frugal:accounts login <id>`).
 - Delegated Claude runs load frugal (`/frugal`), and Codex runs get its core rules in the brief.
 - A delegated run never delegates again, and with no account set up none of this loads.

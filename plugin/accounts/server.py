@@ -54,6 +54,7 @@ READ_ONLY = re.compile(r"(cat|head|tail|less|grep|egrep|fgrep|rg|ls|dir|find|tre
                        r"|basename|dirname|realpath|which|where|git\s+(log|show|diff|status|grep|ls-files|blame|branch|rev-parse)"
                        r"|Get-Content|Get-ChildItem|Select-String|Test-Path)(\s|$)", re.I)
 NEUTRAL = re.compile(r"(cd|echo|printf|true)(\s|$)")
+TIMEOUT = {"heavy": 1200, "max": 1800}  # seconds per agent run; heavy edits ran past 10 minutes and started over
 HEADS_UP = DIR / "heads-up.json"
 HEADS_UP_CALLS = 6  # tool calls in a turn before the side agent looks; shorter turns are not worth a check
 HEADS_UP_MAX = 4  # notes per session, as in Claude Code's own "You should know"
@@ -215,7 +216,7 @@ def run_tree(cmd, timeout, input=None, **kw):
         return None
 
 
-def run_cli(argv, prompt, cwd, env):
+def run_cli(argv, prompt, cwd, env, timeout=600):
     exe = shutil.which(argv[0])  # finds npm's .cmd shims on Windows
     if not exe:
         return 127, "", f"{argv[0]} not found"
@@ -227,12 +228,12 @@ def run_cli(argv, prompt, cwd, env):
         argv, prompt = [*argv, "--prompt-file", tmp], None
     try:
         # PWD is inherited from this session's shell; opencode works there instead of in cwd, so it must match
-        r = run_tree([exe, *argv[1:]], 600, input=prompt, cwd=cwd, env={**env, "PWD": cwd} if cwd else env)
+        r = run_tree([exe, *argv[1:]], timeout, input=prompt, cwd=cwd, env={**env, "PWD": cwd} if cwd else env)
     finally:
         if tmp:
             os.unlink(tmp)
     if r is None:
-        return 124, "", "timed out after 10 minutes"
+        return 124, "", f"timed out after {timeout // 60} minutes"
     return r[0], r[1].strip(), r[2].strip()
 
 
@@ -325,7 +326,7 @@ def brief(text, kind, check, level, effort, cwd):
             env.update(GROK_CLAUDE_MCPS_ENABLED="false", GROK_CLAUDE_HOOKS_ENABLED="false")  # grok loads Claude's MCP servers and hooks by default
         off = [n for n in only if n in codex_mcp()] if a["kind"] == "codex" else []
         try:
-            code, out, err = run_cli(argv_for(a, kind, model, eff, off), prompt, cwd, env)
+            code, out, err = run_cli(argv_for(a, kind, model, eff, off), prompt, cwd, env, TIMEOUT.get(level, 600))
         finally:
             with LOCK:
                 BUSY[a["id"]] -= 1
@@ -802,7 +803,7 @@ def selftest():
     # delegate's check, with a stub agent that always claims success
     prompts, g = [], globals()
     real = {k: g[k] for k in ("run_cli", "load", "save")}
-    g.update(run_cli=lambda argv, prompt, cwd, env: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
+    g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
              load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None)
     envs = []
     try:
@@ -821,7 +822,7 @@ def selftest():
         assert "passed" not in r and "Do it here" in r, r
         # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
         os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
-        g.update(run_cli=lambda argv, prompt, cwd, env: (envs.append((argv[0], env)), (0, "ok", ""))[1],
+        g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (envs.append((argv[0], env)), (0, "ok", ""))[1],
                  load=lambda: {"claude_only_mcp": ["serviceminder"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
         assert brief("look", "search", None, None, None, ".").startswith("Done by") and brief("note", "note", None, None, None, ".") == "ok"
         (k1, e1), (k2, e2) = envs[-2:]
