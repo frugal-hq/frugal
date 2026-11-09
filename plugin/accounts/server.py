@@ -213,7 +213,8 @@ def run_cli(argv, prompt, cwd, env):
             f.write(prompt)
         argv, prompt = [*argv, "--prompt-file", tmp], None
     try:
-        r = run_tree([exe, *argv[1:]], 600, input=prompt, cwd=cwd, env=env)
+        # PWD is inherited from this session's shell; opencode works there instead of in cwd, so it must match
+        r = run_tree([exe, *argv[1:]], 600, input=prompt, cwd=cwd, env={**env, "PWD": cwd} if cwd else env)
     finally:
         if tmp:
             os.unlink(tmp)
