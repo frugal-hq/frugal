@@ -115,11 +115,29 @@ def today():
     return datetime.date.today().isoformat()
 
 
+def same(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
 def own(a):
     # The account this session runs on is its primary, never one of its secondaries.
-    same = lambda p: os.path.normcase(os.path.abspath(p))
     mine = os.environ.get("CLAUDE_CONFIG_DIR") or str(HOME / ".claude")
     return os.environ.get(ROLES) != "off" and bool(a.get("config_dir")) and same(a["config_dir"]) == same(mine)
+
+
+def session_mcp(cwd):
+    """This session's MCP servers, user scope plus the project's. Only a Claude delegate gets them, and only the ones a task names:
+    which agents may reach a server's data is each project's rule, and frugal never hands these to Codex, Grok or OpenCode."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR")
+    try:
+        data = json.loads((Path(folder) / ".claude.json" if folder else HOME / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    servers = dict(data.get("mcpServers") or {})
+    for project, conf in (data.get("projects") or {}).items():
+        if same(project) == same(cwd):
+            servers.update(conf.get("mcpServers") or {})
+    return servers
 
 
 def ready(accounts, now=None):
@@ -174,12 +192,15 @@ def blocked(a, data):
             and not data.get("opencode_allow_training", False))
 
 
-def argv_for(a, kind, model, effort, mcp_off=()):
+def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_names=()):
     if a["kind"] == "claude" and kind == "note":
         return ["claude", "-p", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
-        tools = ["--allowedTools", "Bash Read Grep Glob"] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Grep Glob Edit Write"]
-        return ["claude", "-p", "--model", model, "--effort", effort, *tools]
+        # Claude Code names a server's tools mcp__<name>__<tool>, with characters outside [A-Za-z0-9_-] turned into _.
+        allowed = " ".join(["Bash Read Grep Glob" if kind in ("search", "run") else "Bash Read Grep Glob Edit Write",
+                            *(f"mcp__{re.sub(r'[^A-Za-z0-9_-]', '_', n)}" for n in mcp_names)])
+        tools = ["--allowedTools", allowed] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", allowed]
+        return ["claude", "-p", "--model", model, "--effort", effort, *tools, *(["--mcp-config", mcp_file] if mcp_file else [])]
     if a["kind"] == "grok":
         # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
@@ -291,9 +312,13 @@ def relogin(ids):
     return "".join(f"frugal: secondary account {i} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
 
 
-def brief(text, kind, check, level, effort, cwd):
+def brief(text, kind, check, level, effort, cwd, mcp=()):
     if check and kind == "run":
         return run_brief(text, check, level, effort, cwd)
+    found = session_mcp(cwd) if mcp else {}
+    if (missing := [n for n in mcp if n not in found]):
+        return f"frugal: this session has no MCP server named {', '.join(missing)}. Do it here."
+    servers = {n: found[n] for n in mcp}
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
     failure, tried, relog = "", [], []
     if check:
@@ -302,7 +327,9 @@ def brief(text, kind, check, level, effort, cwd):
         with LOCK:
             data = load()
             # A heads-up note carries the session transcript, which never goes to Grok or OpenCode.
-            pool = [a for a in order(data["accounts"], BUSY) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode")) and not blocked(a, data)]
+            # A task that needs this session's MCP servers goes only to Claude accounts.
+            pool = [a for a in order(data["accounts"], BUSY) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode"))
+                    and not (servers and a["kind"] != "claude") and not blocked(a, data)]
             if not pool:
                 break
             a = pool[0]
@@ -325,11 +352,18 @@ def brief(text, kind, check, level, effort, cwd):
         if a["kind"] == "grok":
             env.update(GROK_CLAUDE_MCPS_ENABLED="false", GROK_CLAUDE_HOOKS_ENABLED="false")  # grok loads Claude's MCP servers and hooks by default
         off = [n for n in only if n in codex_mcp()] if a["kind"] == "codex" else []
+        mcp_file = None
+        if servers:  # a file, not an argument: server configs can carry tokens, and a command line is visible to every process
+            fd, mcp_file = tempfile.mkstemp(suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"mcpServers": servers}, f)
         try:
-            code, out, err = run_cli(argv_for(a, kind, model, eff, off), prompt, cwd, env, TIMEOUT.get(level, 600))
+            code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, list(servers)), prompt, cwd, env, TIMEOUT.get(level, 600))
         finally:
             with LOCK:
                 BUSY[a["id"]] -= 1
+            if mcp_file:
+                os.unlink(mcp_file)
         with LOCK, file_lock():
             data = load()
             for x in data["accounts"]:
@@ -377,6 +411,8 @@ SPEC = {
         "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the session's project dir."},
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
+        "mcp": {"type": "array", "items": {"type": "string"},
+                "description": "MCP servers of this session the task needs (the <name> in mcp__<name>__ tools). Only a Claude account takes it."},
     }},
 }
 
@@ -387,7 +423,7 @@ def delegate(args):
         return "frugal: give a task or tasks."
     cwd = args.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     with concurrent.futures.ThreadPoolExecutor(len(briefs)) as ex:
-        out = list(ex.map(lambda b: brief(b, args.get("kind", "search"), args.get("check"), args.get("level"), args.get("effort"), cwd), briefs))
+        out = list(ex.map(lambda b: brief(b, args.get("kind", "search"), args.get("check"), args.get("level"), args.get("effort"), cwd, args.get("mcp") or ()), briefs))
     return out[0] if len(out) == 1 else "\n\n".join(f"## Task {i}\n{r}" for i, r in enumerate(out, 1))
 
 
@@ -798,6 +834,13 @@ def selftest():
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
     assert nudge(EXPLORE_BUDGET + 1, 0, "x").startswith("frugal: the last prompt ran 4") and nudge(9, 1, "x") == "" and nudge(EXPLORE_BUDGET, 0, "x") == ""
+    cfg = Path(tempfile.mkdtemp())
+    (cfg / ".claude.json").write_text(json.dumps({"mcpServers": {"sm": {"command": "a"}}, "projects": {
+        str(cfg).replace("\\", "/"): {"mcpServers": {"p": {"command": "b"}}}, "elsewhere": {"mcpServers": {"q": {"command": "c"}}}}}), encoding="utf-8")
+    saved_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
+    a = argv_for(claude, "search", "sonnet", "low", (), "m.json", ["sm", "my server"])
+    assert a[-2:] == ["--mcp-config", "m.json"] and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
     # delegate's check, with a stub agent that always claims success
@@ -822,15 +865,28 @@ def selftest():
         assert "passed" not in r and "Do it here" in r, r
         # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
         os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
-        g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (envs.append((argv[0], env)), (0, "ok", ""))[1],
+        assert set(session_mcp(str(cfg))) == {"sm", "p"}
+        g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (envs.append((argv[0], env, argv)), (0, "ok", ""))[1],
                  load=lambda: {"claude_only_mcp": ["serviceminder"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
         assert brief("look", "search", None, None, None, ".").startswith("Done by") and brief("note", "note", None, None, None, ".") == "ok"
-        (k1, e1), (k2, e2) = envs[-2:]
+        (k1, e1, a1), (k2, e2, _) = envs[-2:]
         assert k1 in ("grok", "opencode") and "FRUGALTEST_SERVICEMINDER_TOKEN" not in e1 and e1.get("GROK_CLAUDE_MCPS_ENABLED", "false") == "false"
-        assert k2 == "claude" and "FRUGALTEST_SERVICEMINDER_TOKEN" in e2
+        assert k2 == "claude" and "FRUGALTEST_SERVICEMINDER_TOKEN" in e2 and "--mcp-config" not in a1
+        # A task naming an MCP server skips the others and reaches Claude with only that server; an unknown name runs nowhere.
+        assert brief("look up a customer", "search", None, None, None, str(cfg), ["sm"]).startswith("Done by") and envs[-1][0] == "claude"
+        argv = envs[-1][2]
+        assert "--mcp-config" in argv and "mcp__sm" in argv[argv.index("--allowedTools") + 1] and "mcp__p" not in argv[argv.index("--allowedTools") + 1]
+        assert not os.path.exists(argv[argv.index("--mcp-config") + 1])
+        n = len(envs)
+        assert "no MCP server named nope" in brief("x", "search", None, None, None, str(cfg), ["nope"]) and len(envs) == n
     finally:
         os.environ.pop("FRUGALTEST_SERVICEMINDER_TOKEN", None)
         g.update(real)
+        if saved_cfg is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = saved_cfg
+        shutil.rmtree(cfg)
     return "selftest ok"
 
 

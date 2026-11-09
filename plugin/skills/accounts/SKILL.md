@@ -22,4 +22,4 @@ Add and log in open a terminal that closes itself when the login ends, then chec
 
 After the first account is added, the `delegate` tool appears in the next session (or after `/mcp` reconnects the frugal server).
 
-MCP servers only Claude may use: list their names under `"claude_only_mcp"` in `~/.frugal/accounts.json`. Codex runs get those servers disabled and lose any environment variable carrying the server's name (its token); Grok runs never load Claude's MCP servers or hooks. OpenCode does not read Claude's MCP servers.
+MCP servers only Claude may use: list their names under `"claude_only_mcp"` in `~/.frugal/accounts.json`. Codex runs get those servers disabled and lose any environment variable carrying the server's name (its token); Grok runs never load Claude's MCP servers or hooks. OpenCode does not read Claude's MCP servers. A task that needs one of the session's MCP servers names it in delegate's `mcp`: it then runs only on a Claude account, which gets just that server.

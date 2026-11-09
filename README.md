@@ -100,7 +100,7 @@ Add and login verify the signed-in email before an account joins the pool. From 
 - Delegated Claude runs load frugal (`/frugal`), and Codex runs get its core rules in the brief.
 - A delegated run never delegates again, and with no account set up none of this loads.
 - OpenCode models that may train on what they receive (Big Pickle, MiMo, Flint, Iceman, Inkling, Nemotron) are blocked unless `opencode-training` is on.
-- MCP servers listed under `claude_only_mcp` in `~/.frugal/accounts.json` stay with Claude.
+- A brief that names MCP servers in `mcp` runs only on a Claude account, which gets just those servers from the session's own config (user scope and the project's). Other agents never get the session's MCP servers; which agents may use a server is each project's rule. Servers listed under `claude_only_mcp` in `~/.frugal/accounts.json` are also turned off in Codex's own config.
 - Heads-up, in Claude Desktop only: after a turn with 6 or more tool calls, a side agent on a secondary account (no tools, light level) reads the end of the transcript and names one thing you might miss, shown as one `Heads up:` line. At most 8 checks and 4 notes per session. `/frugal:heads-up off` turns it off for the session, `off all` everywhere, `on` / `on all` back on. The transcript excerpt goes to that account, and never to Grok or OpenCode.
 
 **Humanizer is opt-in.** The first time frugal is about to write text for people, it asks once: Yes, No, Always this session, or Never this session. It never runs for code, commits, or internal notes.
