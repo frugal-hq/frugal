@@ -466,11 +466,19 @@ def rule(event):
     ids = ", ".join(a["id"] for a in ready(load()["accounts"]))
     first = s.get("announced") != ids
     DIR.mkdir(exist_ok=True)
-    state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "agent": False}), encoding="utf-8")
+    state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "delegated": 0, "agent": False}), encoding="utf-8")
     if first:
         return (f"frugal: secondary accounts {ids} are set up. Delegate every bounded task with {TOOL}, level per task; "
                 "keep here only design, judgment calls and the final check.")
-    return f"frugal: delegate bounded work to {ids}; keep here only design and the final check."
+    return nudge(s.get("reads", 0), s.get("delegated", 0), ids)
+
+
+def nudge(reads, delegated, ids):
+    # The same line on every prompt went unread (one session got it 120 times and delegated 14 times in 34 prompts);
+    # this one shows only after a prompt that explored here, and says how much.
+    if reads > EXPLORE_BUDGET and not delegated:
+        return f"frugal: the last prompt ran {reads} reads and searches here and delegated none. Send bounded pieces to {ids} with {TOOL}."
+    return ""
 
 
 def heavy(cmd):
@@ -515,6 +523,8 @@ def gate(event):
             reason = count_read()
     elif tool in ("Read", "Grep", "Glob"):
         reason = count_read()
+    elif tool == TOOL:
+        s["delegated"] = s.get("delegated", 0) + 1
     elif tool == "Agent" and not s.get("agent"):
         s["agent"] = True
         reason = (f"frugal: a subagent here runs on the main account. Give this to {TOOL} instead (one brief per piece in \"tasks\"). "
@@ -786,6 +796,7 @@ def selftest():
     assert reads_only("cat a.py | grep -n x") and reads_only("cd src && git log --oneline -3 2>/dev/null") and reads_only("Get-Content f; ls")
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
+    assert nudge(EXPLORE_BUDGET + 1, 0, "x").startswith("frugal: the last prompt ran 4") and nudge(9, 1, "x") == "" and nudge(EXPLORE_BUDGET, 0, "x") == ""
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
     # delegate's check, with a stub agent that always claims success
