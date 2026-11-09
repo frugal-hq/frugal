@@ -16,6 +16,7 @@ DIR = HOME / ".frugal"
 FILE = DIR / "accounts.json"
 TOOL = "mcp__plugin_frugal_accounts__delegate"
 DELEGATED = "FRUGAL_DELEGATED"  # set on every delegated run, so it never delegates again
+ROLES = "FRUGAL_ROLES"  # "off" from Frugal Deck's settings: a session may also delegate to its own account
 LOCK = threading.Lock()
 
 LEVELS = ["light", "standard", "heavy", "max"]
@@ -108,9 +109,16 @@ def today():
     return datetime.date.today().isoformat()
 
 
+def own(a):
+    # The account this session runs on is its primary, never one of its secondaries.
+    same = lambda p: os.path.normcase(os.path.abspath(p))
+    mine = os.environ.get("CLAUDE_CONFIG_DIR") or str(HOME / ".claude")
+    return os.environ.get(ROLES) != "off" and bool(a.get("config_dir")) and same(a["config_dir"]) == same(mine)
+
+
 def ready(accounts, now=None):
     now = time.time() if now is None else now
-    return [a for a in accounts if a.get("enabled", True) and not a.get("needs_login") and a.get("exhausted_until", 0) <= now]
+    return [a for a in accounts if a.get("enabled", True) and not a.get("needs_login") and a.get("exhausted_until", 0) <= now and not own(a)]
 
 
 def active():
@@ -700,6 +708,15 @@ def selftest():
             {"id": "lim", "exhausted_until": now + 60}, {"id": "old", "used": 9, "day": "2000-01-01"}]
     assert [a["id"] for a in order(pool, {})] == ["old", "b", "a"]
     assert [a["id"] for a in ready([{"id": "out", "needs_login": True}, {"id": "in"}])] == ["in"]
+    saved = {k: os.environ.pop(k, None) for k in ("CLAUDE_CONFIG_DIR", ROLES)}
+    mine = [{"id": "me", "config_dir": str(HOME / ".claude-me") + os.sep}, {"id": "x", "config_dir": str(HOME / ".claude-x")}, {"id": "cx"}]
+    os.environ["CLAUDE_CONFIG_DIR"] = str(HOME / ".claude-me")
+    assert [a["id"] for a in ready(mine)] == ["x", "cx"]
+    os.environ[ROLES] = "off"
+    assert len(ready(mine)) == 3
+    del os.environ["CLAUDE_CONFIG_DIR"], os.environ[ROLES]
+    assert [a["id"] for a in ready([{"id": "main", "config_dir": str(HOME / ".claude")}, {"id": "cx"}])] == ["cx"]
+    os.environ.update({k: v for k, v in saved.items() if v is not None})
     assert AUTH.search("API Error: 401 OAuth token has expired") and AUTH.search("Please run /login") and not AUTH.search("ok")
     assert [a["id"] for a in order(pool, {"old": 1})] == ["b", "a", "old"]
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
