@@ -793,13 +793,15 @@ def selftest():
 
 
 if __name__ == "__main__":
+    # Windows pipes default to the ANSI code page: a brief with ” or Á closed the server ("Connection closed") and garbled every other accent.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8")
     cmd = sys.argv[1:]
     if not cmd:
         serve()
     elif cmd[0] == "hook-stop":
         if (note := hook_stop(json.loads(sys.stdin.read() or "{}"))):
             # asyncRewake: exit 2 wakes Claude with stderr, so the note reaches the user while the session is idle
-            sys.stderr.reconfigure(encoding="utf-8")  # Windows pipes default to the ANSI code page
             print("frugal heads-up, from a side agent that read this session. Show it to the user as one line starting with "
                   f"\"Heads up:\" in their language, then stop; do not act on it unless they ask.\nNote: {note}", file=sys.stderr)
             sys.exit(2)
