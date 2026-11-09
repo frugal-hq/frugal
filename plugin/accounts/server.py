@@ -8,7 +8,7 @@ One file, stdlib only, four roles:
   server.py list | add <claude|codex|grok> <id> | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
 """
-import concurrent.futures, contextlib, datetime, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib
+import concurrent.futures, contextlib, datetime, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
 from pathlib import Path
 
 HOME = Path.home()
@@ -405,7 +405,12 @@ def serve():
             result = {"tools": [SPEC] if active() else []}
         elif method == "tools/call":
             p = req.get("params", {})
-            text = delegate(p.get("arguments") or {}) if p.get("name") == "delegate" and active() else "frugal: no secondary account is set up."
+            try:
+                text = delegate(p.get("arguments") or {}) if p.get("name") == "delegate" and active() else "frugal: no secondary account is set up."
+            except Exception as e:  # one bad call must not close the server for the rest of the session
+                with open(DIR / "errors.log", "a", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+                text = f"frugal: delegate failed ({type(e).__name__}: {e}). Do it here."
             result = {"content": [{"type": "text", "text": text}]}
         elif method == "ping":
             result = {}
