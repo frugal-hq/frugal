@@ -3,7 +3,7 @@
 One file, stdlib only, four roles:
   server.py                 MCP server (stdio) exposing `delegate` while an account is set up
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
-  server.py hook-pretool    PreToolUse hook: sends test runs, long explorations and subagents to delegate
+  server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too) and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
   server.py list | add <claude|codex|grok> <id> | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
@@ -49,6 +49,11 @@ CODEX_RULES = (
     "security or error handling that prevents data loss."
 )
 EXPLORE_BUDGET = 3
+# Shell commands that only read. A chain of them counts against EXPLORE_BUDGET as Read and Grep do: in one day 816 shell reads went uncounted.
+READ_ONLY = re.compile(r"(cat|head|tail|less|grep|egrep|fgrep|rg|ls|dir|find|tree|wc|stat|file|du|awk|sed|jq|sort|uniq|cut|column|nl|diff|cmp"
+                       r"|basename|dirname|realpath|which|where|git\s+(log|show|diff|status|grep|ls-files|blame|branch|rev-parse)"
+                       r"|Get-Content|Get-ChildItem|Select-String|Test-Path)(\s|$)", re.I)
+NEUTRAL = re.compile(r"(cd|echo|printf|true)(\s|$)")
 HEADS_UP = DIR / "heads-up.json"
 HEADS_UP_CALLS = 6  # tool calls in a turn before the side agent looks; shorter turns are not worth a check
 HEADS_UP_MAX = 4  # notes per session, as in Claude Code's own "You should know"
@@ -474,6 +479,18 @@ def heavy(cmd):
     return bool(HEAVY_RUN.search(head)) and not re.search(r"\bssh\s", head) and "CLAUDE_CONFIG_DIR=" not in head
 
 
+def reads_only(cmd):
+    """True when each command of a chain or pipeline only reads (cat, grep, ls, git log), with no redirect into a file."""
+    if "<<" in cmd or "`" in cmd or "$(" in cmd:
+        return False
+    s = re.sub(r"\d?>\s*(/dev/null|&\d|\$null)", "", cmd)
+    if ">" in s or re.search(r"\bsed\b[^|;&]*\s(-i|--in-place)", s) or re.search(r"\bfind\b[^|;&]*\s-(delete|exec|ok)", s):
+        return False
+    parts = [re.sub(r"^([A-Za-z_]\w*=\S*\s+)+", "", p.strip()) for p in re.split(r"&&|\|\||;|\|", s)]
+    parts = [p for p in parts if p and not NEUTRAL.match(p)]
+    return bool(parts) and all(READ_ONLY.match(p) for p in parts)
+
+
 def gate(event):
     """The reason to send this tool call to delegate, or None to let it run."""
     if not active() or event.get("agent_id"):
@@ -481,6 +498,12 @@ def gate(event):
     sid, tool, inp = event.get("session_id", ""), event.get("tool_name", ""), event.get("tool_input") or {}
     s = read_state(sid)
     reason = None
+    def count_read():
+        s["reads"] = s.get("reads", 0) + 1
+        if s["reads"] == EXPLORE_BUDGET + 1:
+            return (f"frugal: {EXPLORE_BUDGET} reads and searches this prompt already. Hand the rest of this exploration to {TOOL} "
+                    "(kind \"search\", pieces in \"tasks\") and work from its summary. If you need the raw text here, call again.")
+        return None
     if tool in ("Bash", "PowerShell"):
         cmd = inp.get("command", "")
         if heavy(cmd) and cmd not in s.get("waived", []):
@@ -488,11 +511,10 @@ def gate(event):
             reason = (f"frugal: send this to {TOOL} with kind \"run\", the exact command as \"check\" and a brief asking for the failures; "
                       "it runs the command once in bash and returns its real exit code and output. If it says \"Do it here\", "
                       "run the same command again and it goes through.")
+        elif reads_only(cmd):
+            reason = count_read()
     elif tool in ("Read", "Grep", "Glob"):
-        s["reads"] = s.get("reads", 0) + 1
-        if s["reads"] == EXPLORE_BUDGET + 1:
-            reason = (f"frugal: {EXPLORE_BUDGET} reads and searches this prompt already. Hand the rest of this exploration to {TOOL} "
-                      "(kind \"search\", pieces in \"tasks\") and work from its summary. If you need the raw text here, call again.")
+        reason = count_read()
     elif tool == "Agent" and not s.get("agent"):
         s["agent"] = True
         reason = (f"frugal: a subagent here runs on the main account. Give this to {TOOL} instead (one brief per piece in \"tasks\"). "
@@ -761,6 +783,9 @@ def selftest():
     os.utime(old, (0, 0))
     prune()
     assert not old.exists()
+    assert reads_only("cat a.py | grep -n x") and reads_only("cd src && git log --oneline -3 2>/dev/null") and reads_only("Get-Content f; ls")
+    assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
+    assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
     # delegate's check, with a stub agent that always claims success
