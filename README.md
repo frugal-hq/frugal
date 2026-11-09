@@ -1,55 +1,17 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/frugal-mark-amber.svg">
+  <img src="docs/brand/frugal-mark.svg" alt="frugal logo" width="72">
+</picture>
+
 # frugal
+
+[![Version](https://img.shields.io/badge/version-0.26.0-blue)](#versions)
+[![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
 A low-token working mode for Claude Code. Type `/frugal` and it stays on for the rest of the session.
 
-frugal is built around one fact about agent sessions: most of the bill is input, not output. Every call re-reads the system prompt, the history, and every file and tool result in context. Shorter replies help a little; keeping the context small and making fewer calls helps much more.
-
-## What it does
-
-`/frugal` loads a 2.3KB core. A short task (3 tool calls or fewer) needs nothing else. Longer tasks read more rules by path, only the ones they need:
-
-| Part | Loaded | What it does |
-|---|---|---|
-| `SKILL.md` | on `/frugal` | Terse replies that report results, not process; exact terms, numbers, and negations; verify APIs and versions instead of guessing; a few always-on code rules; opt-in humanizer |
-| `core.md` | tasks over 3 tool calls, the 10th message, or any module named after `/frugal` | Batched tool calls, no re-reading unchanged files, questions only when the answer changes the result, module picking |
-| `code.md` | with `core.md`, when the task writes, fixes, or reviews code | Minimal code: does it need to exist, reuse what the codebase has, stdlib and native platform features before dependencies, root-cause fixes, one runnable check for non-trivial logic. Refactors, migrations, verify-only tasks, and commit messages in one line each. Never cuts validation, security, accessibility, or error handling that prevents data loss |
-| `modules/analysis.md` | data, research, metrics, reports | Finding first; every number with a source or derivation and units; missing data, low confidence, and inferences labeled |
-| `modules/delegate.md` | secondary accounts set up (any bounded task), raw material too big to read directly (roughly 100k+ tokens), or independent heavy parts | With secondary accounts, sends every bounded task to them; without, hands reading to `haiku` and bounded edits to `sonnet`, never above the session model; escalates a part only when it fails |
-| `modules/session.md` | the 10th message (then every 15th, from a hook), a compaction, a new unrelated task, or a model or effort that does not fit the task | Says which model and effort fit, with a ready-to-paste prompt per task, and a handoff block for a fresh chat |
-| `modules/review.md` | reviews, audits, shortcut lists | Diff review with bugs and over-engineering in one pass, one line per finding; whole-repo audit ranked by lines saved; a ledger of `frugal:` shortcut comments |
-| `modules/compress.md` | on request | Rewrites CLAUDE.md or another memory file to fewer bytes with a backup, keeping every instruction; saved on every call after |
-| `scripts/usage.sh` | before a handoff in the CLI, or when you ask about usage | Context size and token totals from the session transcript, where `get_usage` is not available |
-| `modules/agents.md` | pipelines, subagent prompts, machine-read output | Structured, parseable output; no narration; never invents paths, endpoints, or field names |
-| `plugin/hooks/session-count.sh` | every prompt, prints nothing until needed | When `/frugal` is active (typed, or in a pasted handoff), injects `core.md` and `session.md` at the 10th message and every 15th after, and the handoff rule each time the context passes another 150k tokens. Counts from the transcript, so a plugin reinstall does not reset it. Tells the model to load the skill when `/frugal` only came in pasted text. Needs `sh` (Git Bash on Windows) |
-| `accounts/server.py`, `skills/accounts` | only while `~/.frugal/accounts.json` lists an account | Secondary Claude and Codex logins that take delegated work: the `delegate` tool, the delegation rule, and the gates below. Needs `python` on the PATH |
-| `humanizer` | only if you say yes | Rewrites AI-sounding text. Based on [blader/humanizer](https://github.com/blader/humanizer), MIT |
-
-The read instruction is the first line of the core and names both files at once. Haiku skipped a chain of reads ("read core, then the module it points to") in every run, and follows a single direct instruction in every run. You can force modules yourself: `/frugal analysis coding`.
-
-**Cheaper models without settings.** The plugin ships two subagents, `frugal-scout` (read-only search and extraction) and `frugal-worker` (bounded edits). The `delegate` module passes the model on every call, so nothing in your settings changes:
-
-| Session model | Search, read, extract | Bounded edits |
-|---|---|---|
-| Fable | haiku | sonnet |
-| Opus | haiku | sonnet |
-| Sonnet | haiku | sonnet |
-| Haiku | haiku | haiku |
-
-It delegates only when the raw material is too big to read directly, or more than ~30k tokens in a session that continues for many turns. Each subagent starts with an empty cache, and in the bench reading 30 contracts (~32k tokens) directly cost less than splitting them across three subagents. Once it delegates, the main thread does not redo the work: it spot-checks at most two results, or all of them when an error would touch money, security, legal terms, or unrecoverable data. A part that fails is re-run one model up (`haiku` to `sonnet`), and only that part.
-
-**Secondary accounts.** Other Claude logins and Codex can take the bounded work, so the main account's limits last. Set them up with `/frugal:accounts`: `add claude <id>` (its config lives in `~/.claude-<id>`, so its login never touches the main one) or `add codex <id>`; a login terminal opens. From then on, in every session:
-
-- The `delegate` tool runs each brief on the least-used account, in parallel for independent pieces, and moves to the next account when one hits its limit.
-- Each provider gets its own model and effort per level: Claude `haiku`/`sonnet`/`opus` with low to max effort, Codex `gpt-6-luna`/`gpt-6.1-sol`/`gpt-6-astra` (only models the login lists) with low to xhigh. Work defaults to the standard level (`sonnet`, medium).
-- A hook adds the delegation rule to each prompt. Another sends test and build runs, a fourth read or search in one prompt, and subagents to `delegate` once; asking again runs them here.
-- A logged-out account leaves the pool, and each prompt names the command to sign it in again (`/frugal:accounts login <id>`).
-- Delegated Claude runs load frugal (`/frugal`), and Codex runs get its core rules in the brief.
-- A delegated run never delegates again, and with no account set up none of this loads.
-- Heads-up, in Claude Desktop only (Claude Code's own "You should know" never runs there): after a turn with 6 or more tool calls, a side agent on a secondary account (no tools, light level: `haiku` or `gpt-6-luna`) reads the end of the transcript and names one thing you might miss, such as an exposed secret, an unverified claim, or something asked and not done. A note wakes Claude, which shows it as one `Heads up:` line. At most 8 checks and 4 notes per session, so it never drains the account delegate needs; never the same note twice. `/frugal:heads-up off` turns it off for the session, `off all` everywhere, `on` / `on all` back on. The transcript excerpt goes to that account.
-
-**Humanizer is opt-in.** The first time frugal is about to write text for people (a customer email, a ticket reply, docs, a post), it asks once: Yes, No, Always this session, or Never this session. It never runs for code, commits, or internal notes.
-
-frugal covers what caveman and ponytail do, so you do not need them. If they are enabled, disable them: their rules are added to every call (see [Benchmarks](#benchmarks)).
+Most of an agent session's bill is input, not output: every call re-reads the system prompt, the history, and every file and tool result in context. Shorter replies help a little; keeping the context small and making fewer calls helps much more.
 
 ## Install
 
@@ -58,9 +20,9 @@ frugal covers what caveman and ponytail do, so you do not need them. If they are
 Paste this into Claude Code (CLI, desktop, or IDE), Claude Cowork, Codex, Cursor, or any agent that can run shell commands:
 
 ```text
-Install the frugal plugin from https://github.com/CroaBeast/frugal for me.
+Install the frugal plugin from https://github.com/frugal-hq/frugal for me.
 
-1. If you are Claude Code: run `claude plugin marketplace add CroaBeast/frugal`, then `claude plugin install frugal@frugal`. Tell me to start a new session and type /frugal.
+1. If you are Claude Code: run `claude plugin marketplace add frugal-hq/frugal`, then `claude plugin install frugal@frugal`. Tell me to start a new session and type /frugal.
 2. Otherwise, if you support Agent Skills (folders containing a SKILL.md): clone the repo to a temporary folder and copy every folder under plugin/skills/ into your user skills directory. Tell me how to invoke the frugal skill.
 3. Otherwise: add the text of plugin/skills/frugal/SKILL.md without its front matter, then plugin/skills/frugal/core.md and plugin/skills/frugal/code.md, to your persistent instructions file (for example AGENTS.md) and tell me which file you changed.
 
@@ -72,7 +34,7 @@ Outside Claude Code, the subagents (`frugal-scout`, `frugal-worker`) and the mod
 ### By hand, in Claude Code
 
 ```
-/plugin marketplace add CroaBeast/frugal
+/plugin marketplace add frugal-hq/frugal
 /plugin install frugal@frugal
 ```
 
@@ -88,21 +50,75 @@ Open a new session and type `/frugal`. If you also have a separate copy of `huma
 
 Say `normal mode` to turn it off.
 
+Name modules after `/frugal` to force them, for example `/frugal analysis coding`.
+
+## What it does
+
+`/frugal` loads a 2.6KB core. A short task (3 tool calls or fewer) needs nothing else. Longer tasks read more rules by path, only the ones they need:
+
+| Part | Loaded | What it does |
+|---|---|---|
+| `SKILL.md` | on `/frugal` | Terse replies, exact terms and numbers, APIs and versions verified instead of guessed |
+| `core.md` | tasks over 3 tool calls, the 10th message, or a module named after `/frugal` | Batched tool calls, no re-reads, questions only when the answer changes the result |
+| `code.md` | with `core.md`, on code tasks | Minimal code: reuse first, stdlib before dependencies, root-cause fixes, one runnable check. Never cuts validation, security, accessibility, or error handling that prevents data loss |
+| `modules/analysis.md` | data, research, metrics, reports | Finding first; every number with a source and units; inferences labeled |
+| `modules/delegate.md` | secondary accounts set up, input of roughly 100k+ tokens, or independent heavy parts | Sends bounded work to secondary accounts, or to `haiku` and `sonnet` subagents |
+| `modules/session.md` | the 10th message, then every 15th; a compaction; a new task; a model that does not fit | Model and effort advice, and a handoff block for a fresh chat |
+| `modules/review.md` | reviews, audits, shortcut lists | One line per finding; audits ranked by lines saved |
+| `modules/compress.md` | on request | Rewrites a memory file to fewer bytes, with a backup, keeping every instruction |
+| `modules/agents.md` | pipelines, subagent prompts, machine-read output | Parseable output, no narration, no invented paths or fields |
+| `scripts/usage.sh` | before a CLI handoff, or when you ask about usage | Context size and token totals from the session transcript |
+| `plugin/hooks/session-count.sh` | every prompt, silent until needed | Injects `core.md` and `session.md` on schedule, and the handoff rule every 150k tokens. Needs `sh` (Git Bash on Windows) |
+| `accounts/server.py`, `skills/accounts` | only while `~/.frugal/accounts.json` lists an account | Secondary Claude, Codex, Grok, and OpenCode accounts that take delegated work. Needs `python` on the PATH |
+| `humanizer` | only if you say yes | Rewrites AI-sounding text. Based on [blader/humanizer](https://github.com/blader/humanizer), MIT |
+
+**Cheaper models without settings.** The plugin ships two subagents, `frugal-scout` (read-only search and extraction) and `frugal-worker` (bounded edits). The `delegate` module passes the model on every call, so nothing in your settings changes:
+
+| Session model | Search, read, extract | Bounded edits |
+|---|---|---|
+| Fable, Opus, Sonnet | haiku | sonnet |
+| Haiku | haiku | haiku |
+
+It delegates only when the raw material is too big to read directly, or more than ~30k tokens in a session that continues for many turns, because each subagent starts with an empty cache. The main thread then spot-checks at most two results, or all of them when an error would touch money, security, legal terms, or unrecoverable data. A part that fails is re-run one model up, and only that part.
+
+**Secondary accounts.** Other Claude logins, Codex, Grok, and OpenCode can take the bounded work, so the main account's limits last. Set them up with `/frugal:accounts`:
+
+| Command | Login | Needs |
+|---|---|---|
+| `add claude <id>` | Its own config in `~/.claude-<id>`, so it never touches the main login | |
+| `add codex <id>` | The Codex login on this machine | |
+| `add grok <id>` | The Grok Build login on this machine | `npm install -g @xai-official/grok` |
+| `add opencode <id> <provider/model>` | One model per account, data in `~/.frugal/opencode-<id>`; free models need no login | `npm install -g opencode-ai` |
+
+Add and login verify the signed-in email before an account joins the pool. From then on, in every session:
+
+- The `delegate` tool runs each brief on the least-used account, in parallel for independent pieces, and moves to the next account when one hits its limit.
+- Each provider gets its own model and effort per level: Claude `haiku`/`sonnet`/`opus` with low to max effort, Codex `gpt-6-luna`/`gpt-6.1-sol`/`gpt-6-astra` (only models the login lists) with low to xhigh, Grok `grok-4.6` with low to xhigh, OpenCode the account's one model. Work defaults to the standard level (`sonnet`, medium).
+- A hook adds the delegation rule to each prompt. Another sends test and build runs, a fourth read or search in one prompt, and subagents to `delegate` once; asking again runs them here.
+- A logged-out account leaves the pool, and each prompt names the command to sign it in again (`/frugal:accounts login <id>`).
+- Delegated Claude runs load frugal (`/frugal`), and Codex runs get its core rules in the brief.
+- A delegated run never delegates again, and with no account set up none of this loads.
+- OpenCode models that may train on what they receive (Big Pickle, MiMo, Flint, Iceman, Inkling, Nemotron) are blocked unless `opencode-training` is on.
+- MCP servers listed under `claude_only_mcp` in `~/.frugal/accounts.json` stay with Claude.
+- Heads-up, in Claude Desktop only: after a turn with 6 or more tool calls, a side agent on a secondary account (no tools, light level) reads the end of the transcript and names one thing you might miss, shown as one `Heads up:` line. At most 8 checks and 4 notes per session. `/frugal:heads-up off` turns it off for the session, `off all` everywhere, `on` / `on all` back on. The transcript excerpt goes to that account, and never to Grok or OpenCode.
+
+**Humanizer is opt-in.** The first time frugal is about to write text for people, it asks once: Yes, No, Always this session, or Never this session. It never runs for code, commits, or internal notes.
+
+frugal covers what caveman and ponytail do, so you do not need them. If they are enabled, disable them: their rules are added to every call (see [Benchmarks](#benchmarks)).
+
 ## Should you use it?
 
-On Opus 5.5 (0.15, six tasks) frugal came out even on cost with 11% less output; on feature work (ponytail's harness, 0.18.4) it cost 38% less than plain Claude Code on Opus 5.5 and 13% less on Sonnet 5.5, and on Haiku 4.5 it passed every check where plain Claude Code missed 10 of 117 runs, at a cost within noise (-7%):
-
-- **Long sessions and heavy tasks:** in 0.14, 10 to 12% cheaper on the 40-message session, the heavy coding task, and the contract risk review. Every call re-reads the whole history, so shorter replies and fewer re-reads compound as a session grows. The 16-message session came out -2%: at the 10th message frugal writes a handoff block for a fresh chat, which only pays back when you actually move to one (see [BENCHMARKS.md](BENCHMARKS.md)).
-- **Short one-off tasks:** +1 to +8% on Opus. Turning frugal on costs ~1,140 input tokens once per session (about 0.009 USD on Opus), and a 3-call task has too little output to win that back.
-- **Writing features:** on ponytail's own harness (39 tasks, n=3, same batch), 0.18.4 against ponytail 5.2.0 passed every check on all three models and cost 8.3% less on Haiku 4.5, 5.8% less on Sonnet 5.5, and 6.2% less on Opus 5.5. It wrote less code on Haiku and about the same on Sonnet and Opus (see below).
+- **Feature work:** on ponytail's harness (39 tasks, n=3), 0.18.4 cost 38% less than plain Claude Code on Opus 5.5 and 13% less on Sonnet 5.5, and on Haiku 4.5 it passed every check where plain Claude Code missed 10 of 117 runs, at a cost within noise (-7%). Against ponytail 5.2.0 it passed every check on all three models and cost 8.3% less on Haiku 4.5, 5.8% less on Sonnet 5.5, and 6.2% less on Opus 5.5.
+- **Long sessions and heavy tasks:** in 0.14, 10 to 12% cheaper on the 40-message session, the heavy coding task, and the contract risk review, because shorter replies and fewer re-reads compound as a session grows. On Opus 5.5 (0.15, six tasks) it came out even on cost with 11% less output.
+- **Short one-off tasks:** it costs more. In 0.25.2, four short tasks cost 7 to 10% more than no plugins on all three models: they have too little output to win back the cost of loading frugal.
 - **Plain questions:** on caveman's own eval, 0.16.0 answered with 28 to 45% fewer output tokens than caveman at the same judged quality.
 - **Behavior, not just tokens:** verify APIs and versions instead of guessing, build the sensible default instead of stopping to ask, minimal code that keeps validation and tests, opt-in humanizer for text people read.
 
-**Questions cost tokens too.** Each question is one extra call: the model writes the question, your answer comes back, and the whole context is read again (mostly from cache, which is cheaper). That is why frugal asks only when missing information would change the result: one question is much cheaper than redoing work built on a wrong guess.
+**Questions cost tokens too.** Each one is an extra call that reads the whole context again, so frugal asks only when missing information would change the result.
 
 ## Model routing and other tools
 
-A skill cannot switch the session's model or effort. frugal routes its subagents, and when a task fits another model: a bounded task goes to a subagent on the cheaper model automatically; open-ended work, or work that needs a stronger model than the session, gets a prompt to paste in a new chat with the model and effort to use. Small tasks it does in place, since a new chat re-pays the system prompt. Beyond that, Claude Code has its own controls, and they combine with frugal:
+A skill cannot switch the session's model or effort. frugal routes its subagents; open-ended work, or work that needs a stronger model than the session, gets a prompt to paste in a new chat with the model and effort to use. Beyond that, Claude Code has its own controls, and they combine with frugal:
 
 | Option | What it routes | Notes |
 |---|---|---|
@@ -111,13 +127,11 @@ A skill cannot switch the session's model or effort. frugal routes its subagents
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Default model for subagents | frugal passes the model explicitly anyway |
 | A proxy such as claude-code-router or OmniRoute | Every request, by rules or cost | Needs provider API keys and routes to non-Anthropic models, so the quality claim above no longer holds |
 
-Switching models inside one session also throws away the prompt cache, which is per model: the next call re-pays the whole context at the uncached rate. That is why per-request routing pays off in your own app with independent requests, and much less inside one long agent session.
-
-Knowledge-graph tools such as Graphify target a different cost (exploring very large repos) and are not measured here.
+Switching models inside one session throws away the prompt cache, which is per model, so the next call re-pays the whole context at the uncached rate.
 
 ## Benchmarks
 
-Every number here comes from real headless Claude Code sessions (`claude -p`), checked automatically, with every arm run in the same batch, and losses are shown next to wins. caveman and ponytail publish numbers from their own setups: caveman from single API calls against a model with no system prompt, ponytail from feature tasks on Haiku only. Here each plugin runs the way you would use it, on three tests and three models. Per-task tables, methods, and every earlier batch are in [BENCHMARKS.md](BENCHMARKS.md).
+Every number comes from real headless Claude Code sessions (`claude -p`), checked automatically, with every arm run in the same batch, and losses are shown next to wins. Per-task tables, methods, and every earlier batch are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ```mermaid
 xychart-beta horizontal
@@ -128,11 +142,24 @@ xychart-beta horizontal
     line [100, 100, 100, 100, 100, 100]
 ```
 
-Each bar is frugal 0.18.4 against one other arm on one model, both run in the same batch on ponytail's harness (39 tasks, n=3); the line at 100 is that other arm. frugal passed every check in all six batches. Pass rates and lines are in the tables under [Against plain Claude Code](#benchmarks) and [Latest head-to-head](#benchmarks) below.
+Each bar is frugal 0.18.4 against one other arm on one model, both run in the same batch on ponytail's harness (39 tasks, n=3); the line at 100 is that other arm. frugal passed every check in all six batches. Pass rates and lines are in [the head-to-head against ponytail](BENCHMARKS.md#head-to-head-frugal-0184-against-ponytail-520-three-models) and [the run against no plugins](BENCHMARKS.md#frugal-0184-against-no-plugins-three-models).
+
+Plain Claude Code missed `trace-transfer` safety in 3 of 3 Haiku runs, wrote no file in 7 Haiku runs, and timed out (300 s) on all 3 Opus runs of `vibe-md2html`.
+
+```mermaid
+xychart-beta horizontal
+    title "frugal 0.25.2 short tasks cost (no plugins = 100), lower is cheaper"
+    x-axis ["Haiku", "Sonnet", "Opus"]
+    y-axis "Relative cost" 0 --> 130
+    bar [107.5, 110.1, 108.0]
+    line [100, 100, 100]
+```
+
+This is a different test from the chart above: four short tasks from `bench.py` (`t0_ok`, `t1_bug`, `t2_analysis`, `t3_email`), n=5, frugal 0.25.2 against no plugins. frugal cost 7 to 10% more here: a short task has too little output to win back the cost of loading it (+648 to +1,455 input tokens per call), even with median output 7 to 13% lower. All 120 runs passed their checks.
 
 ### Summary: every test, every model
 
-Feature work rows are the five-arm batches that ran every plugin together (frugal 0.17.0, ponytail 4.10.0); the latest two-arm results are in the chart above. Cost relative to the baseline of the same batch (= 100; lower is cheaper). Each row is one batch, so compare across a row, not down a column. Pass rates and per-task results are in [BENCHMARKS.md](BENCHMARKS.md). "Not run" means that combination has no batch yet.
+Feature work rows are the five-arm batches that ran every plugin together (frugal 0.17.0, ponytail 4.10.0); the latest two-arm results are in the first chart above. Cost relative to the baseline of the same batch (= 100; lower is cheaper). Each row is one batch, so compare across a row, not down a column. "Not run" means that combination has no batch yet.
 
 | Test | Model | No plugins | frugal | caveman | ponytail | ponytail + caveman |
 |---|---|---|---|---|---|---|
@@ -146,31 +173,17 @@ Feature work rows are the five-arm batches that ran every plugin together (fruga
 | | Sonnet 5.5 | 100 | **77.5** | 89.2 | | |
 | | Opus 5.5 | 100 | **91.9** | 92.4 | | |
 
+<details>
+<summary>Batches</summary>
+
 Batches: feature work, Haiku 2026-10-04 (frugal 0.17.0 before its last rule) Sonnet 2026-10-07 and Opus 2026-10-07 to 08 (frugal 0.17.0; Opus has 34 of 39 tasks, the rest stopped at the usage limit); `bench.py` Opus 2026-10-03 (frugal 0.15), Haiku and Sonnet 2026-10-20 to 21 (frugal 0.18.5); caveman's eval Opus 2026-10-03 (frugal 0.15), Haiku and Sonnet 2026-10-21 (frugal 0.18.5; Haiku has 14 answers per arm, the rest hit the session limit; baseline "Answer concisely."; caveman's eval has no ponytail arm).
+
+</details>
 
 **Where frugal loses.** On `bench.py` with Opus, one-step tasks cost 6 to 16% more than no plugins (1 to 8% in a 0.16.0 rerun): turning frugal on adds a fixed ~1,140 input tokens that a 3-call task cannot win back. Longer tasks pay it back, and the six-task sum comes out even on Opus and 10% cheaper on Haiku. On Sonnet (0.18.5) the six tasks cost 4.6% more: the short ones +2 to +7%, and the heavy and review tasks did not win the fixed cost back. The same fixed cost shows on Haiku feature work: the 12 small fix, security, and reuse tasks cost 19% more than no plugins (Sonnet +1%, Opus -10%), because a $0.03 task cannot absorb the extra rules and the caller and sibling search that bug fixes do.
 
-**Latest head-to-head.** frugal 0.18.4 against ponytail 5.2.0 on ponytail's own harness (39 tasks, n=3, both arms in one batch per model, 2026-10-15 to 20):
-
-| Model | Correct, frugal / ponytail | Safe | Lines (median) | frugal cost vs ponytail (90% CI) |
-|---|---|---|---|---|
-| Haiku 4.5 | **1.000** / 0.983 | **1.000** / 0.974 | **27** / 32 | **-8.3%** (-13.8% to -2.6%) |
-| Sonnet 5.5 | 1.000 / 1.000 | 1.000 / 1.000 | 29 / 28 | **-5.8%** (-9.2% to -3.0%) |
-| Opus 5.5 | **1.000** / 0.991 | 1.000 / 1.000 | 34 / 31 | **-6.2%** (-10.4% to -2.1%) |
-
-ponytail still writes a few lines less on Sonnet and Opus, mostly line wrapping in frontend components and the guards frugal adds when it fixes a shared helper. The five-arm batches above ran earlier versions against ponytail 4.10.0.
-
-**Against plain Claude Code.** frugal 0.18.4 against no plugins, same harness (39 tasks, n=3, both arms in one batch per model, 2026-10-20 to 21):
-
-| Model | Correct, frugal / no plugins | Safe | Lines (median) | frugal cost vs no plugins (90% CI) |
-|---|---|---|---|---|
-| Haiku 4.5 | **1.000** / 0.940 | **1.000** / 0.974 | **24** / 48 | -6.6% (-14.0% to +1.2%) |
-| Sonnet 5.5 | 1.000 / 1.000 | 1.000 / 1.000 | **30** / 73 | **-13.1%** (-19.0% to -7.2%) |
-| Opus 5.5 | **1.000** / 0.974 | 1.000 / 1.000 | **34** / 91 | **-38.2%** (-45.6% to -29.9%) |
-
-Plain Claude Code missed `trace-transfer` safety in 3 of 3 Haiku runs, wrote no file in 7 Haiku runs, and timed out (300 s) on all 3 Opus runs of `vibe-md2html`.
-
-### Reproduce
+<details>
+<summary>Reproduce</summary>
 
 ```
 cd bench
@@ -187,14 +200,21 @@ python run.py ... --resume <run dir>      # finish a batch cut by a usage limit
 
 A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench.py run` skips runs that already have results and does not save runs that hit the usage limit, so re-running the same command fills the gaps. Rep 1 of each batch pays for writing the prompt cache, so the fixed-cost table uses only later reps. How the batches are kept small is in [BENCHMARKS.md](BENCHMARKS.md#tests).
 
+</details>
+
 ## Versions
 
+- **0.26.0**: Grok and OpenCode secondary accounts; `claude_only_mcp` keeps chosen MCP servers with Claude; heads-up notes never go to Grok or OpenCode; OpenCode models that may train are blocked unless `opencode-training` is on; add and login verify the signed-in email before an account joins the pool; OpenCode runs in the requested folder.
 - **0.25.3**: delegate's `check` runs in bash (Git Bash on Windows), not cmd.exe; with kind `run` it runs once, before any agent, and the reply is its real exit code and output, with an agent explaining only a failure; a check that cannot run (missing tool, Docker permission, timeout) answers "Do it here"; edit agents get the check in their brief. The hook no longer sends `ssh` commands or mentions of `bench.py` to delegate, and says how to get out of it.
 - **0.25.2**: delegated commands no longer inherit the MCP server's stdin; parallel sessions lock frugal's files before writing them; session state older than a week is removed.
 - **0.25.1**: heads-up checks use the light level and stop after 8 per session, so they do not spend the account delegate needs.
 - **0.25.0**: heads-up notes in Claude Desktop from a side agent on a secondary account, with `/frugal:heads-up` to turn them off.
 - **0.24.1**: a delegated run or check that times out kills its whole process tree, so it no longer hangs on Windows.
 - **0.24.0**: the handoff comes from context size (every 150k tokens) instead of message count; a pasted handoff loads frugal; the session hook reads the whole prompt and survives a plugin reinstall.
+
+<details>
+<summary>Older versions</summary>
+
 - **0.23.0**: delegated Claude runs load frugal, and Codex runs get its core rules.
 - **0.22.2**: explorations hand off after three reads, so the main session can read what an edit needs.
 - **0.22.1**: a logged-out secondary account leaves the pool, and every prompt names the command to sign it in again.
@@ -221,6 +241,8 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 - **0.3.0 to 0.6.0**: modular skills, standalone (no caveman or ponytail needed), opt-in humanizer.
 - **0.2.0**: light and heavy work triaged per message; coding and analysis profiles dropped.
 - **0.1.0, 0.1.1**: single skill on top of caveman and ponytail at `ultra`, with task profiles; the most expensive setup in the benchmarks.
+
+</details>
 
 ## Licenses
 
