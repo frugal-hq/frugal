@@ -1,14 +1,14 @@
-"""frugal accounts: secondary Claude and Codex logins that take delegated work.
+"""frugal accounts: secondary Claude, Codex, Grok and OpenCode logins that take delegated work.
 
 One file, stdlib only, four roles:
   server.py                 MCP server (stdio) exposing `delegate` while an account is set up
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
-  server.py list | add <claude|codex> <id> | remove <id> | login <id> | selftest
+  server.py list | add <claude|codex|grok> <id> | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
 """
-import concurrent.futures, contextlib, datetime, json, os, re, shutil, signal, subprocess, sys, threading, time
+import concurrent.futures, contextlib, datetime, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib
 from pathlib import Path
 
 HOME = Path.home()
@@ -26,12 +26,18 @@ RULES = {
                "levels": {"light": ("haiku", "low"), "standard": ("sonnet", "medium"), "heavy": ("opus", "high"), "max": ("opus", "max")}},
     "codex": {"efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
               "levels": {"light": ("gpt-6-luna", "low"), "standard": ("gpt-6.1-sol", "medium"), "heavy": ("gpt-6.1-sol", "high"), "max": ("gpt-6-astra", "xhigh")}},
+    # grok-4.6 rejects minimal and max ("use one of: xhigh, high, medium, low") yet still exits 0.
+    "grok": {"efforts": ["low", "medium", "high", "xhigh"],
+             "levels": {"light": ("grok-4.6", "low"), "standard": ("grok-4.6", "medium"), "heavy": ("grok-4.6", "high"), "max": ("grok-4.6", "xhigh")}},
+    # OpenCode runs the one model its account names; --variant is per provider, and one a model lacks is ignored.
+    "opencode": {"efforts": ["low", "medium", "high"],
+                 "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "high")}},
 }
 DEFAULT_LEVEL = {"search": "standard", "run": "standard", "edit": "standard", "note": "light"}  # light (haiku, low) missed most of a 5-question lookup; pass level "light" only for trivial greps. A heads-up note is one judgment, which haiku makes as well as sonnet
 LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|quota|too many requests|\b429\b", re.I)
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
 AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oauth token (has )?(expired|been revoked)"
-                  r"|invalid (api|x-api) key|authentication_error|not authenticated|login required", re.I)
+                  r"|invalid (api|x-api) key|authentication_error|not authenticated|not signed in|login required", re.I)
 HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|\b(pytest|jest|vitest|tsc|gradlew?|mvn)\b|\bpython\S*\s+\S*bench\.py\b"
                        r"|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b", re.I)
 CODEX_RULES = (
@@ -53,6 +59,8 @@ HEADS_UP_ASK = (
     "user would not expect. Skip anything Claude already told the user plainly, style points and guesses. If nothing clears "
     "that bar, reply exactly: none. Otherwise reply with one plain sentence under 40 words, in the user's language, no preamble."
 )
+# OpenCode Zen models that may train on, or warn against, what they receive (opencode.ai/docs/zen). Blocked until the user turns opencode-training on.
+TRAINING_MODELS = ("big-pickle", "mimo", "flint", "iceman", "inkling", "nemotron")
 MAX_TRIES = 3
 HOUR = 3600
 
@@ -121,6 +129,8 @@ def choose(a, kind, level=None, effort=None):
     # A Codex model the login does not list falls back to the one in its config.toml.
     if a["kind"] == "codex" and model not in (a.get("models") or []):
         model = None
+    if a["kind"] == "opencode":
+        model = a["model"]
     return model, fit(effort or base, rule["efforts"])
 
 
@@ -137,14 +147,35 @@ def codex_models():
         return []
 
 
-def argv_for(a, kind, model, effort):
+def codex_mcp():
+    try:
+        return set(tomllib.loads((HOME / ".codex" / "config.toml").read_text(encoding="utf-8")).get("mcp_servers", {}))
+    except (OSError, ValueError):
+        return set()
+
+
+def blocked(a, data):
+    m = (a.get("model") or "").lower()
+    return (a["kind"] == "opencode" and m.startswith("opencode/") and any(t in m for t in TRAINING_MODELS)
+            and not data.get("opencode_allow_training", False))
+
+
+def argv_for(a, kind, model, effort, mcp_off=()):
     if a["kind"] == "claude" and kind == "note":
         return ["claude", "-p", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
         tools = ["--allowedTools", "Bash Read Grep Glob"] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Grep Glob Edit Write"]
         return ["claude", "-p", "--model", model, "--effort", effort, *tools]
+    if a["kind"] == "grok":
+        # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
+        tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
+        return ["grok", "--no-auto-update", "-m", model, "--effort", effort, "--always-approve", *tools]
+    if a["kind"] == "opencode":
+        # --auto approves what is not denied; the plan agent denies edits, so search stays read-only (tested on opencode 1.19.5)
+        return ["opencode", "run", "-m", model, "--variant", effort, "--agent", "plan" if kind == "search" else "build", "--auto"]
     sandbox = ["-s", "workspace-write"] if kind in ("edit", "run") else []
-    return ["codex", "exec", "--skip-git-repo-check", *(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}", *sandbox, "-"]
+    off = [x for n in mcp_off for x in ("-c", f"mcp_servers.{n}.enabled=false")]  # only servers its config has: an unknown one breaks codex
+    return ["codex", "exec", "--skip-git-repo-check", *(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}", *off, *sandbox, "-"]
 
 
 def run_tree(cmd, timeout, input=None, **kw):
@@ -175,7 +206,17 @@ def run_cli(argv, prompt, cwd, env):
     exe = shutil.which(argv[0])  # finds npm's .cmd shims on Windows
     if not exe:
         return 127, "", f"{argv[0]} not found"
-    r = run_tree([exe, *argv[1:]], 600, input=prompt, cwd=cwd, env=env)
+    tmp = None
+    if argv[0] == "grok":  # grok takes no prompt on stdin, and a long one overflows the command line
+        fd, tmp = tempfile.mkstemp(suffix=".md")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        argv, prompt = [*argv, "--prompt-file", tmp], None
+    try:
+        r = run_tree([exe, *argv[1:]], 600, input=prompt, cwd=cwd, env=env)
+    finally:
+        if tmp:
+            os.unlink(tmp)
     if r is None:
         return 124, "", "timed out after 10 minutes"
     return r[0], r[1].strip(), r[2].strip()
@@ -245,7 +286,8 @@ def brief(text, kind, check, level, effort, cwd):
     for n in range(1, MAX_TRIES + 1):
         with LOCK:
             data = load()
-            pool = [a for a in order(data["accounts"], BUSY) if a["id"] not in tried]
+            # A heads-up note carries the session transcript, which never goes to Grok or OpenCode.
+            pool = [a for a in order(data["accounts"], BUSY) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode")) and not blocked(a, data)]
             if not pool:
                 break
             a = pool[0]
@@ -260,9 +302,16 @@ def brief(text, kind, check, level, effort, cwd):
             prompt = "/frugal:frugal " + prompt  # loads frugal's rules in the delegated session
         else:
             prompt = f"{CODEX_RULES}\n\n{prompt}"  # Codex cannot load the skill, so it gets the essentials
-        env = {**os.environ, DELEGATED: "1", **({"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {})}
+        env = {**os.environ, DELEGATED: "1", **account_env(a)}
+        only = data.get("claude_only_mcp", [])  # MCP servers no other agent may reach
+        if a["kind"] != "claude":
+            # frugal: a token is found by the server's name in the variable (SERVICEMINDER_MCP_TOKEN); read bearer_token_env_var if one is named otherwise.
+            env = {k: v for k, v in env.items() if not any(n.upper() in k.upper() for n in only)}
+        if a["kind"] == "grok":
+            env.update(GROK_CLAUDE_MCPS_ENABLED="false", GROK_CLAUDE_HOOKS_ENABLED="false")  # grok loads Claude's MCP servers and hooks by default
+        off = [n for n in only if n in codex_mcp()] if a["kind"] == "codex" else []
         try:
-            code, out, err = run_cli(argv_for(a, kind, model, eff), prompt, cwd, env)
+            code, out, err = run_cli(argv_for(a, kind, model, eff, off), prompt, cwd, env)
         finally:
             with LOCK:
                 BUSY[a["id"]] -= 1
@@ -525,35 +574,105 @@ def hook_stop(event):
     return note
 
 
+def account_env(a):
+    # OpenCode keeps its login and sessions in its own data folder per account
+    return {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {"XDG_DATA_HOME": a["data_dir"]} if a.get("data_dir") else {}
+
+
+def find_email(x):
+    if isinstance(x, dict):
+        return next((v for k, v in x.items() if "email" in k.lower() and isinstance(v, str)), None) or next(filter(None, map(find_email, x.values())), None)
+    return next(filter(None, map(find_email, x)), None) if isinstance(x, list) else None
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def logged_in(a):
+    """(signed in, email or None). Grok and OpenCode keep their login in auth.json, which grok logout leaves as {}."""
+    if a["kind"] in ("grok", "opencode"):
+        auth = read_json(Path(a["data_dir"]) / "opencode" / "auth.json" if a["kind"] == "opencode"
+                         else Path(os.environ.get("GROK_HOME") or HOME / ".grok") / "auth.json")
+        return bool(auth), find_email(auth)
+    cmd = ["codex", "login", "status"] if a["kind"] == "codex" else ["claude", "auth", "status"]
+    exe = shutil.which(cmd[0])
+    r = run_tree([exe, *cmd[1:]], 60, env={**os.environ, **account_env(a)}) if exe else None
+    if not r:
+        return False, None
+    try:
+        email = find_email(json.loads(r[1]))
+    except ValueError:
+        email = None
+    return r[0] == 0, email
+
+
 def login(a):
-    env = {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {}
-    cmd = "codex login" if a["kind"] == "codex" else "claude auth login"
-    if os.name == "nt":
-        sets = "".join(f'set "{k}={v}" && ' for k, v in env.items())
-        subprocess.Popen(f'start "frugal login {a["id"]}" cmd /k "{sets}{cmd}"', shell=True)
-        return f"Opened a terminal for {a['id']}: sign in there, then close it."
-    return f"Run in a terminal: {' '.join(f'{k}={v}' for k, v in env.items())} {cmd}".strip()
+    """Opens a terminal that closes when the login ends, then checks it. Blocks until then, so run it in the background."""
+    env = account_env(a)
+    cmd = {"codex": "codex login", "grok": "grok login", "opencode": "opencode auth login"}.get(a["kind"], "claude auth login")
+    if os.name != "nt":
+        # frugal: no terminal is opened outside Windows; run login in-process with the user's tty when one is asked for.
+        return f"Run in a terminal: {' '.join(f'{k}={v}' for k, v in env.items())} {cmd}, then: login {a['id']}".strip()
+    sets = "".join(f'set "{k}={v}" && ' for k, v in env.items())
+    subprocess.run(f'start "frugal login {a["id"]}" /wait cmd /c "{sets}{cmd}"', shell=True)
+    ok, email = logged_in(a)
+    with file_lock():
+        data = load()
+        for x in data["accounts"]:
+            if x["id"] == a["id"] and a["kind"] != "opencode":  # OpenCode's free models need no login
+                if ok:
+                    x.pop("needs_login", None)
+                else:
+                    x["needs_login"] = True
+        save(data)
+    who = f" as {email}" if email else ""
+    if ok:
+        return f"{a['id']} is signed in{who}; frugal can use it (run /mcp if it is the first account)."
+    if a["kind"] == "opencode":
+        return f"{a['id']} has no OpenCode login; its free models still work."
+    return f"{a['id']} is not signed in; it stays out of the pool. Try again with: login {a['id']}"
+
+
+PENDING = []  # accounts to sign in once cli() is done: login() waits for the user, so it runs outside the file lock
 
 
 def cli(args):
     data = load()
     if args[:1] == ["list"] or not args:
-        rows = [f"{a['id']}: {a['kind']}{' (off)' if not a.get('enabled', True) else ''}, used today {a.get('used', 0) if a.get('day') == today() else 0}"
+        rows = [f"{a['id']}: {a['kind']}{f" {a['model']}" if a.get('model') else ''}{' (off)' if not a.get('enabled', True) else ''}, used today {a.get('used', 0) if a.get('day') == today() else 0}"
                 + (", at its limit" if a.get("exhausted_until", 0) > time.time() else "")
+                + (", blocked: its model may train on your data (opencode-training on)" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
-        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id>"
-    if args[0] == "add" and len(args) == 3 and args[1] in RULES:
+        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add opencode <id> <provider/model>"
+    if args[0] == "add" and len(args) == (4 if args[1:2] == ["opencode"] else 3) and args[1] in RULES:
         kind, aid = args[1], args[2]
         if any(a["id"] == aid for a in data["accounts"]):
             return f"{aid} is already set up."
         a = {"id": aid, "kind": kind, "enabled": True, "used": 0, "day": ""}
         if kind == "claude":
             a["config_dir"] = str(HOME / f".claude-{aid}")
-        else:
+        elif kind == "codex":
             a["models"] = codex_models()
+        elif kind == "opencode":
+            a["model"], a["data_dir"] = args[3], str(DIR / f"opencode-{aid}")
+            if blocked(a, data):
+                return (f"{args[3]} may train on what it receives, so frugal blocks it. "
+                        "To allow such models, run: opencode-training on")
+        if kind != "opencode":
+            a["needs_login"] = True  # out of the pool until login() confirms it
         data["accounts"].append(a)
         save(data)
-        return f"Added {aid}. " + login(a)
+        PENDING.append(a)
+        return f"Added {aid}."
+    if args[0] == "opencode-training" and args[1:] in (["on"], ["off"]):
+        data["opencode_allow_training"] = args[1] == "on"
+        save(data)
+        return ("OpenCode models that may train on your data are now allowed." if args[1] == "on"
+                else "OpenCode models that may train on your data are blocked.")
     if args[0] == "remove" and len(args) == 2:
         data["accounts"] = [a for a in data["accounts"] if a["id"] != args[1]]
         save(data)
@@ -562,9 +681,8 @@ def cli(args):
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
             return f"No account {args[1]}."
-        a.pop("needs_login", None)  # back in the pool; a login that still fails flags it again on the next task
-        save(data)
-        return login(a)
+        PENDING.append(a)
+        return f"Signing in {a['id']}."
     return __doc__
 
 
@@ -586,6 +704,18 @@ def selftest():
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
     assert argv_for(codex, "run", None, "low")[-3:] == ["-s", "workspace-write", "-"]
     assert argv_for(claude, "note", "sonnet", "medium")[-3:] == ["--tools", "", "--strict-mcp-config"]
+    grok = {"id": "g", "kind": "grok"}
+    assert choose(grok, "edit", "heavy") == ("grok-4.6", "high")
+    assert "--always-approve" in argv_for(grok, "edit", "grok-4.6", "high") and "--tools" not in argv_for(grok, "edit", "grok-4.6", "high")
+    assert argv_for(grok, "search", "grok-4.6", "low")[-2:] == ["--tools", "read_file,grep,list_dir,run_terminal_cmd"]
+    assert AUTH.search("Error: Not signed in. To authenticate")
+    oc = {"id": "o", "kind": "opencode", "model": "opencode/glm-5.3-flash-free", "data_dir": "/d"}
+    assert choose(oc, "search", "max") == ("opencode/glm-5.3-flash-free", "high") and account_env(oc) == {"XDG_DATA_HOME": "/d"}
+    assert argv_for(oc, "search", *choose(oc, "search"))[-4:] == ["medium", "--agent", "plan", "--auto"] and "build" in argv_for(oc, "edit", "m", "low")
+    pickle = {"kind": "opencode", "model": "opencode/big-pickle"}
+    assert blocked(pickle, {}) and not blocked(pickle, {"opencode_allow_training": True}) and not blocked(oc, {})
+    assert not blocked({"kind": "opencode", "model": "openrouter/nvidia/nemotron-x"}, {})
+    assert argv_for(codex, "edit", None, "low", ["serviceminder"])[-5:-3] == ["-c", "mcp_servers.serviceminder.enabled=false"]
     tmp = DIR / "selftest-transcript.jsonl"
     DIR.mkdir(exist_ok=True)
     tmp.write_text("\n".join(json.dumps(e) for e in [
@@ -615,6 +745,7 @@ def selftest():
     real = {k: g[k] for k in ("run_cli", "load", "save")}
     g.update(run_cli=lambda argv, prompt, cwd, env: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
              load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None)
+    envs = []
     try:
         r = brief("run the tests", "run", "MSYS_NO_PATHCONV=1 echo ran-$((1+1))", None, None, ".")  # case 1: bash syntax cmd.exe rejects
         assert r.startswith("frugal: check") and "exited 0, passed" in r and "ran-2" in r and not prompts, r
@@ -629,7 +760,16 @@ def selftest():
         assert "exited 127" in r and "Do it here" in r and len(prompts) == n, r
         r = brief("fix x", "edit", "echo nope; exit 1", None, None, ".")  # a failing check never reads as passed
         assert "passed" not in r and "Do it here" in r, r
+        # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
+        os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
+        g.update(run_cli=lambda argv, prompt, cwd, env: (envs.append((argv[0], env)), (0, "ok", ""))[1],
+                 load=lambda: {"claude_only_mcp": ["serviceminder"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
+        assert brief("look", "search", None, None, None, ".").startswith("Done by") and brief("note", "note", None, None, None, ".") == "ok"
+        (k1, e1), (k2, e2) = envs[-2:]
+        assert k1 in ("grok", "opencode") and "FRUGALTEST_SERVICEMINDER_TOKEN" not in e1 and e1.get("GROK_CLAUDE_MCPS_ENABLED", "false") == "false"
+        assert k2 == "claude" and "FRUGALTEST_SERVICEMINDER_TOKEN" in e2
     finally:
+        os.environ.pop("FRUGALTEST_SERVICEMINDER_TOKEN", None)
         g.update(real)
     return "selftest ok"
 
@@ -655,4 +795,6 @@ if __name__ == "__main__":
         print(selftest())
     else:
         with file_lock():
-            print(cli(cmd))
+            print(cli(cmd), flush=True)
+        for a in PENDING:
+            print(login(a))
