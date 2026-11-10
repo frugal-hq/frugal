@@ -345,7 +345,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=()):
             prompt = "/frugal:frugal " + prompt  # loads frugal's rules in the delegated session
         else:
             prompt = f"{CODEX_RULES}\n\n{prompt}"  # Codex cannot load the skill, so it gets the essentials
-        env = {**os.environ, DELEGATED: "1", **account_env(a)}
+        env = child_env(a, {DELEGATED: "1"})
         only = data.get("claude_only_mcp", [])  # MCP servers no other agent may reach
         if a["kind"] != "claude":
             # frugal: a token is found by the server's name in the variable (SERVICEMINDER_MCP_TOKEN); read bearer_token_env_var if one is named otherwise.
@@ -663,6 +663,14 @@ def account_env(a):
     return {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {"XDG_DATA_HOME": a["data_dir"]} if a.get("data_dir") else {}
 
 
+def child_env(a, extra=None):
+    # The main account uses the default folder, so its delegate drops the CLAUDE_CONFIG_DIR this session may run with.
+    env = {**os.environ, **(extra or {}), **account_env(a)}
+    if env.get("CLAUDE_CONFIG_DIR") and same(env["CLAUDE_CONFIG_DIR"]) == same(HOME / ".claude"):
+        del env["CLAUDE_CONFIG_DIR"]
+    return env
+
+
 def find_email(x):
     if isinstance(x, dict):
         return next((v for k, v in x.items() if "email" in k.lower() and isinstance(v, str)), None) or next(filter(None, map(find_email, x.values())), None)
@@ -684,7 +692,7 @@ def logged_in(a):
         return bool(auth), find_email(auth)
     cmd = ["codex", "login", "status"] if a["kind"] == "codex" else ["claude", "auth", "status"]
     exe = shutil.which(cmd[0])
-    r = run_tree([exe, *cmd[1:]], 60, env={**os.environ, **account_env(a)}) if exe else None
+    r = run_tree([exe, *cmd[1:]], 60, env=child_env(a)) if exe else None
     if not r:
         return False, None
     try:
@@ -786,6 +794,7 @@ def selftest():
     saved = {k: os.environ.pop(k, None) for k in ("CLAUDE_CONFIG_DIR", ROLES)}
     mine = [{"id": "me", "config_dir": str(HOME / ".claude-me") + os.sep}, {"id": "x", "config_dir": str(HOME / ".claude-x")}, {"id": "cx"}]
     os.environ["CLAUDE_CONFIG_DIR"] = str(HOME / ".claude-me")
+    assert "CLAUDE_CONFIG_DIR" not in child_env({"config_dir": str(HOME / ".claude")}) and child_env({"config_dir": str(HOME / ".claude-x")})["CLAUDE_CONFIG_DIR"] == str(HOME / ".claude-x")
     assert [a["id"] for a in ready(mine)] == ["x", "cx"]
     os.environ[ROLES] = "off"
     assert len(ready(mine)) == 3
