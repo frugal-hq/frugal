@@ -11,12 +11,6 @@
       "source": "./plugin",
       "description": "Low-token working mode for Claude Code: terse replies, small context, fewer calls. Opt-in humanizer.",
       "keywords": ["tokens", "efficiency", "cost", "humanizer"]
-    },
-    {
-      "name": "frugal-mod",
-      "source": "./mod",
-      "description": "Hooks layer for frugal: rule injection, context handoff, verify and escalate, zero-token quality gates.",
-      "keywords": ["tokens", "delegation", "accounts"]
     }
   ]
 }
