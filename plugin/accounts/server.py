@@ -200,7 +200,8 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_names=()):
         allowed = " ".join(["Bash Read Grep Glob" if kind in ("search", "run") else "Bash Read Grep Glob Edit Write",
                             *(f"mcp__{re.sub(r'[^A-Za-z0-9_-]', '_', n)}" for n in mcp_names)])
         tools = ["--allowedTools", allowed] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", allowed]
-        return ["claude", "-p", "--model", model, "--effort", effort, *tools, *(["--mcp-config", mcp_file] if mcp_file else [])]
+        # Strict: without it every delegated run starts all of the user's MCP servers (WSL, Python, Node) and leaves them running.
+        return ["claude", "-p", "--model", model, "--effort", effort, *tools, "--strict-mcp-config", *(["--mcp-config", mcp_file] if mcp_file else [])]
     if a["kind"] == "grok":
         # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
@@ -840,7 +841,7 @@ def selftest():
     saved_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
     a = argv_for(claude, "search", "sonnet", "low", (), "m.json", ["sm", "my server"])
-    assert a[-2:] == ["--mcp-config", "m.json"] and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
+    assert a[-3:] == ["--strict-mcp-config", "--mcp-config", "m.json"] and "--strict-mcp-config" in argv_for(claude, "edit", "sonnet", "low") and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
     # delegate's check, with a stub agent that always claims success
