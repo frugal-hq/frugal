@@ -6,5 +6,13 @@
   "author": {
     "name": "CroaBeast"
   },
-  "keywords": ["tokens", "efficiency", "cost", "humanizer"]
+  "keywords": ["tokens", "efficiency", "cost", "humanizer"],
+  "mcpServers": {
+    "accounts": {
+      "command": "python",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/accounts/server.py"
+      ]
+    }
+  }
 }

@@ -23,8 +23,8 @@ Paste this into Claude Code (CLI, desktop, or IDE), Claude Cowork, Codex, Cursor
 Install the frugal plugin from https://github.com/frugal-hq/frugal for me.
 
 1. If you are Claude Code: run `claude plugin marketplace add frugal-hq/frugal`, then `claude plugin install frugal@frugal`. Tell me to start a new session and type /frugal.
-2. Otherwise, if you support Agent Skills (folders containing a SKILL.md): clone the repo to a temporary folder and copy every folder under plugin/skills/ into your user skills directory. Tell me how to invoke the frugal skill.
-3. Otherwise: add the text of plugin/skills/frugal/SKILL.md without its front matter, then plugin/skills/frugal/core.md and plugin/skills/frugal/code.md, to your persistent instructions file (for example AGENTS.md) and tell me which file you changed.
+2. Otherwise, if you support Agent Skills (folders containing a SKILL.md): clone the repo to a temporary folder and copy every folder under skills/ into your user skills directory. Tell me how to invoke the frugal skill.
+3. Otherwise: add the text of skills/frugal/SKILL.md without its front matter, then skills/frugal/core.md and skills/frugal/code.md, to your persistent instructions file (for example AGENTS.md) and tell me which file you changed.
 
 Change nothing else. If the caveman or ponytail plugins are enabled, tell me, but do not disable them yourself.
 ```
@@ -68,7 +68,7 @@ Name modules after `/frugal` to force them, for example `/frugal analysis coding
 | `modules/compress.md` | on request | Rewrites a memory file to fewer bytes, with a backup, keeping every instruction |
 | `modules/agents.md` | pipelines, subagent prompts, machine-read output | Parseable output, no narration, no invented paths or fields |
 | `scripts/usage.sh` | before a CLI handoff, or when you ask about usage | Context size and token totals from the session transcript |
-| `plugin/hooks/session-count.sh` | every prompt, silent until needed | Injects `core.md` and `session.md` on schedule, and the handoff rule every 150k tokens. Needs `sh` (Git Bash on Windows) |
+| `hooks/session-count.sh` | every prompt, silent until needed | Injects `core.md` and `session.md` on schedule, and the handoff rule every 150k tokens. Needs `sh` (Git Bash on Windows) |
 | `accounts/server.py`, `skills/accounts` | only while `~/.frugal/accounts.json` lists an account | Secondary Claude, Codex, Grok, and OpenCode accounts that take delegated work. Needs `python` on the PATH |
 | `humanizer` | only if you say yes | Rewrites AI-sounding text. Based on [blader/humanizer](https://github.com/blader/humanizer), MIT |
 

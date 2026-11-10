@@ -18,7 +18,7 @@ TERSE = "Answer concisely."
 ARMS = {
     "terse": TERSE,
     "caveman": TERSE + "\n\n" + (CAVEMAN / "skills/caveman/SKILL.md").read_text(encoding="utf-8"),
-    "frugal": TERSE + "\n\n" + (FRUGAL / "plugin/skills/frugal/SKILL.md").read_text(encoding="utf-8"),
+    "frugal": TERSE + "\n\n" + (FRUGAL / "skills/frugal/SKILL.md").read_text(encoding="utf-8"),
 }
 JUDGE = (
     "You grade an answer to a developer's question. Score how well it lets the developer understand and act: "

@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "frugal",
-      "source": "./plugin",
+      "source": "./",
       "description": "Low-token working mode for Claude Code: terse replies, small context, fewer calls. Opt-in humanizer.",
       "keywords": ["tokens", "efficiency", "cost", "humanizer"]
     }
