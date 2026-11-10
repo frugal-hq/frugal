@@ -37,6 +37,7 @@ Goal: <one sentence>
 Done: <bullets with file paths, settings changed, decisions made and why>
 Pending: <bullets, in order>
 Key context: <facts the new chat cannot derive: versions, constraints, user preferences>
+Read first: <up to 3 file paths the next step needs; omit the line if none>
 Next step: <the first concrete action>
 Usage: <context tokens and %, 5-hour %, weekly % and reset time in UTC, top categories>
 ```
