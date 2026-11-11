@@ -34,6 +34,7 @@ Before any handoff block, including one the user asks for, call `get_usage` (`mc
 ```
 /frugal <modules that apply>
 Goal: <one sentence>
+Project: <what the new chat needs to keep working on the project, folder, client or site this chat is about; omit the line if none>
 Done: <bullets with file paths, settings changed, decisions made and why>
 Pending: <bullets, in order>
 Key context: <facts the new chat cannot derive: versions, constraints, user preferences>
@@ -43,4 +44,4 @@ Usage: <context tokens and %, 5-hour %, weekly % and reset time in UTC, top cate
 ```
 ````
 
-Under 250 words, facts only.
+Under 250 words, facts only, plus the Project line. A chat tied to a project, folder, client or site (a website, a client's system, a product) loses what is not written down: the Project line names it and records everything important about it, such as paths, URLs, repos and branches, environments, accounts used (never secrets), its instruction files (CLAUDE.md, AGENTS.md) with the rules the next step depends on, conventions the user set in this chat, and decisions specific to it. Keep it complete even past the word limit.
