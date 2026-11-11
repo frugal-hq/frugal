@@ -9,4 +9,4 @@
 **Modules**, per task, only what it needs: read `modules/<name>.md` (next to this file) once, batched with your next call; keep until the task changes. Names after `/frugal` always load (`code` and `coding` are `code.md`, next to this file).
 `analysis`: data, research, metrics, reports. `delegate`: secondary accounts set up (any bounded task), or raw material too big to read here (~100k+ tokens), or independent heavy parts. `session`: user's 10th message, a compaction, an unrelated new task, a model or effort that does not fit the task, or a usage question. `review`: review a diff, audit for over-engineering, list shortcuts. `compress`: shrink CLAUDE.md or another memory file. `change`: refactor, migration, verify-only task, commit message. `agents`: pipelines, subagent prompts, machine-read output.
 
-**Precedence:** user > modules > this file > SKILL.md; on accuracy, the stricter rule.
+**Precedence:** user > project instructions > modules > this file > SKILL.md; on accuracy, the stricter rule.

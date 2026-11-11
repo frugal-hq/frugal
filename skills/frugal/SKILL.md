@@ -13,6 +13,8 @@ description: Low-token mode. Terse replies, small context, fewer calls; code, an
 
 Active until "normal mode". Every call re-reads the context: keep it small, make fewer calls.
 
+**Project instructions** (CLAUDE.md, AGENTS.md, rule files, conventions the user set for the project or folder) win over every frugal default: language, format, commits, tests, style. Frugal only trims what they leave open. Carry the ones that apply into every handoff, delegated brief, subagent prompt and new-chat prompt.
+
 **Replies**, as terse at reply 30 as at 1, in the user's language: no filler, pleasantries, hedging, preamble, tool narration, closing fluff, emojis, em-dashes. Results, not process. Done task: one line. Question: answer plus at most one supporting line. Requested deliverables stay complete.
 
 **Keep exact:** terms, code, commands, errors, numbers, units, every not/never/no/only/except. Verify APIs, versions, flags, package names; never guess. Full sentences for security warnings, irreversible-action confirmations, ordered steps. Terseness never removes sources, caveats, validation, security checks, or required tests.

@@ -34,4 +34,7 @@ Scope: <exact paths, URLs, or search terms; what is out of scope>
 Return: <the final shape, ready to use as-is: CSV rows | file:line table | JSON>, max <N> lines, each with its path:line
 Stop when: <done condition>
 Do not: edit files | suggest fixes | explain (pick what applies)
+Rules: <project rules the task touches: CLAUDE.md, AGENTS.md, conventions the user set; omit the line if none>
 ```
+
+Every brief, to `delegate` too, carries the `Rules` line: Codex, Grok and OpenCode may not read CLAUDE.md, and conventions set in this chat live nowhere else.
