@@ -62,7 +62,7 @@ Name modules after `/frugal` to force them, for example `/frugal analysis coding
 | `core.md` | tasks over 3 tool calls, the 10th message, or a module named after `/frugal` | Batched tool calls, no re-reads, questions only when the answer changes the result |
 | `code.md` | with `core.md`, on code tasks | Minimal code: reuse first, stdlib before dependencies, root-cause fixes, one runnable check. Never cuts validation, security, accessibility, or error handling that prevents data loss |
 | `modules/analysis.md` | data, research, metrics, reports | Finding first; every number with a source and units; inferences labeled |
-| `modules/delegate.md` | secondary accounts set up, input of roughly 100k+ tokens, or independent heavy parts | Sends bounded work to secondary accounts, or to `haiku` and `sonnet` subagents |
+| `modules/delegate.md` | a bounded task of three or more tool calls, with or without secondary accounts, or independent heavy parts | Sends bounded work to secondary accounts, or to `haiku` and `sonnet` subagents |
 | `modules/session.md` | the 10th message, then every 15th; a compaction; a new task; a model that does not fit | Model and effort advice, and a handoff block for a fresh chat |
 | `modules/review.md` | reviews, audits, shortcut lists | One line per finding; audits ranked by lines saved |
 | `modules/compress.md` | on request | Rewrites a memory file to fewer bytes, with a backup, keeping every instruction |
@@ -94,7 +94,7 @@ Add and login verify the signed-in email before an account joins the pool. From 
 
 - The `delegate` tool runs each brief on the least-used account, in parallel for independent pieces, and moves to the next account when one hits its limit.
 - Each provider gets its own model and effort per level: Claude `haiku`/`sonnet`/`opus` with low to max effort, Codex `gpt-6-luna`/`gpt-6.1-sol`/`gpt-6-astra` (only models the login lists) with low to xhigh, Grok `grok-4.6` with low to xhigh, OpenCode the account's one model. Work defaults to the standard level (`sonnet`, medium).
-- A hook adds the delegation rule to the first prompt, and to a later one only when the prompt before it ran more than 3 reads or searches here and delegated nothing. Another sends test and build runs, a fourth read or search in one prompt (shell commands that only read, such as `cat`, `grep` or `git log`, count too), and subagents to `delegate` once; asking again runs them here.
+- A hook adds the delegation rule to the first prompt, and to a later one only when the prompt before it ran more than 5 reads or searches here and delegated nothing. Another sends test and build runs and subagents to `delegate` once (asking again runs them here); a sixth read or search in one prompt (shell commands that only read, such as `cat`, `grep` or `git log`, count too) still runs, with a note to hand the rest to `delegate`.
 - Each delegated run gets 10 minutes, 20 at the heavy level and 30 at max.
 - A logged-out account leaves the pool, and each prompt names the command to sign it in again (`/frugal:accounts login <id>`).
 - Delegated Claude runs load frugal (`/frugal`), and Codex runs get its core rules in the brief.
@@ -205,6 +205,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.27.0**: without secondary accounts, every bounded task of three or more tool calls goes to a subagent on the cheapest model that fits (`haiku` with lower effort for search and reading, `sonnet` for edits; `frugal-worker` defaults to `sonnet`). With them, a sixth read or search in one prompt still runs, with a note to hand the rest to `delegate`, instead of being blocked and repeated. Delegates get this session's MCP login as a header and only the tools a server marks read-only: no account logs in twice, and a delegate can read a ticket but never answer one.
 - **0.26.1**: the handoff block has a `Read first:` line with up to 3 paths, and a `Project:` line that keeps everything important about the project, folder, client or site the chat is about, even past the word limit. Project instructions (CLAUDE.md, AGENTS.md, conventions the user set) win over frugal's defaults and travel into handoffs, delegated briefs (a new `Rules:` line) and subagent prompts.
 - **0.26.0**: Grok and OpenCode secondary accounts; `claude_only_mcp` keeps chosen MCP servers with Claude; heads-up notes never go to Grok or OpenCode; OpenCode models that may train are blocked unless `opencode-training` is on; add and login verify the signed-in email before an account joins the pool; OpenCode runs in the requested folder.
 - **0.25.3**: delegate's `check` runs in bash (Git Bash on Windows), not cmd.exe; with kind `run` it runs once, before any agent, and the reply is its real exit code and output, with an agent explaining only a failure; a check that cannot run (missing tool, Docker permission, timeout) answers "Do it here"; edit agents get the check in their brief. The hook no longer sends `ssh` commands or mentions of `bench.py` to delegate, and says how to get out of it.
