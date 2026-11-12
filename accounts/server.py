@@ -48,7 +48,7 @@ CODEX_RULES = (
     "features, files, abstractions or config. Fix bugs at the root cause, and fix siblings with the same bug. Never cut validation, "
     "security or error handling that prevents data loss."
 )
-EXPLORE_BUDGET = 3
+EXPLORE_BUDGET = 5
 # Shell commands that only read. A chain of them counts against EXPLORE_BUDGET as Read and Grep do: in one day 816 shell reads went uncounted.
 READ_ONLY = re.compile(r"(cat|head|tail|less|grep|egrep|fgrep|rg|ls|dir|find|tree|wc|stat|file|du|awk|sed|jq|sort|uniq|cut|column|nl|diff|cmp"
                        r"|basename|dirname|realpath|which|where|git\s+(log|show|diff|status|grep|ls-files|blame|branch|rev-parse)"
@@ -626,18 +626,19 @@ def reads_only(cmd):
 
 
 def gate(event):
-    """The reason to send this tool call to delegate, or None to let it run."""
+    """(reason to deny this tool call and send it to delegate, note added to context while it runs); None where nothing applies."""
     if not active() or event.get("agent_id"):
-        return None
+        return None, None
     sid, tool, inp = event.get("session_id", ""), event.get("tool_name", ""), event.get("tool_input") or {}
     s = read_state(sid)
-    reason = None
+    reason = note = None
+    # A denied read is repeated with the whole context re-read, so past the budget a read still runs and only gets a note.
     def count_read():
+        nonlocal note
         s["reads"] = s.get("reads", 0) + 1
         if s["reads"] == EXPLORE_BUDGET + 1:
-            return (f"frugal: {EXPLORE_BUDGET} reads and searches this prompt already. Hand the rest of this exploration to {TOOL} "
-                    "(kind \"search\", pieces in \"tasks\") and work from its summary. If you need the raw text here, call again.")
-        return None
+            note = (f"frugal: {EXPLORE_BUDGET} reads and searches this prompt already. Hand the rest of this exploration to {TOOL} "
+                    "(kind \"search\", pieces in \"tasks\") and work from its summary.")
     if tool in ("Bash", "PowerShell"):
         cmd = inp.get("command", "")
         if heavy(cmd) and cmd not in s.get("waived", []):
@@ -646,9 +647,9 @@ def gate(event):
                       "it runs the command once in bash and returns its real exit code and output. If it says \"Do it here\", "
                       "run the same command again and it goes through.")
         elif reads_only(cmd):
-            reason = count_read()
+            count_read()
     elif tool in ("Read", "Grep", "Glob"):
-        reason = count_read()
+        count_read()
     elif tool == TOOL:
         s["delegated"] = s.get("delegated", 0) + 1
     elif tool == "Agent" and not s.get("agent"):
@@ -657,7 +658,7 @@ def gate(event):
                   "If it needs this session's own tools, call again and it goes through.")
     DIR.mkdir(exist_ok=True)
     state(sid).write_text(json.dumps(s), encoding="utf-8")
-    return reason
+    return reason, note
 
 
 def heads_up():
@@ -931,7 +932,7 @@ def selftest():
     assert reads_only("cat a.py | grep -n x") and reads_only("cd src && git log --oneline -3 2>/dev/null") and reads_only("Get-Content f; ls")
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
-    assert nudge(EXPLORE_BUDGET + 1, 0, "x").startswith("frugal: the last prompt ran 4") and nudge(9, 1, "x") == "" and nudge(EXPLORE_BUDGET, 0, "x") == ""
+    assert nudge(EXPLORE_BUDGET + 1, 0, "x").startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1}") and nudge(9, 1, "x") == "" and nudge(EXPLORE_BUDGET, 0, "x") == ""
     cfg = Path(tempfile.mkdtemp())
     (cfg / ".claude.json").write_text(json.dumps({"mcpServers": {"sm": {"command": "a"}}, "projects": {
         str(cfg).replace("\\", "/"): {"mcpServers": {"p": {"command": "b"}}}, "elsewhere": {"mcpServers": {"q": {"command": "c"}}}}}), encoding="utf-8")
@@ -1020,8 +1021,12 @@ if __name__ == "__main__":
         event = json.loads(sys.stdin.read() or "{}")
         if cmd[0] == "hook-prompt":
             print(hook_prompt(event))
-        elif (reason := gate(event)):
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}))
+        else:
+            reason, note = gate(event)
+            if reason:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}))
+            elif note:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}}))
     elif cmd[0] == "selftest":
         print(selftest())
     else:
