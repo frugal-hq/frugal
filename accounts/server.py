@@ -140,6 +140,88 @@ def session_mcp(cwd):
     return servers
 
 
+def with_auth(servers, now=None):
+    """Hands this session's MCP OAuth access token to the delegate as a header, so no account logs in to a server twice.
+    The delegate never sees the refresh token, so it never rotates the session's login. Returns (servers, expired names)."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR")
+    try:
+        tokens = json.loads((Path(folder) if folder else HOME / ".claude").joinpath(".credentials.json").read_text(encoding="utf-8")).get("mcpOAuth") or {}
+    except (OSError, ValueError):
+        return servers, []  # frugal: macOS keeps these in the keychain; read it with `security find-generic-password` if needed
+    now = time.time() if now is None else now
+    out, expired = {}, []
+    for name, conf in servers.items():
+        headers = conf.get("headers") or {}
+        t = next((t for t in tokens.values() if t.get("serverName") == name and t.get("serverUrl") == conf.get("url") and t.get("accessToken")), None)
+        if not t or not conf.get("url") or any(k.lower() == "authorization" for k in headers):
+            out[name] = conf
+        elif t.get("expiresAt") and t["expiresAt"] / 1000 < now + 300:
+            expired.append(name)
+        else:
+            out[name] = {**conf, "headers": {**headers, "Authorization": f"Bearer {t['accessToken']}"}}
+    return out, expired
+
+
+def mcp_rule(server, tool=None):
+    # Claude Code names a server's tools mcp__<name>__<tool>, with characters outside [A-Za-z0-9_-] turned into _.
+    return "mcp__" + "__".join(re.sub(r"[^A-Za-z0-9_-]", "_", x) for x in (server, tool) if x)
+
+
+def list_tools(conf):
+    """An HTTP MCP server's tools over streamable HTTP, or None when they cannot be listed."""
+    import urllib.request
+    head = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **(conf.get("headers") or {})}
+
+    def call(body):
+        with urllib.request.urlopen(urllib.request.Request(conf["url"], json.dumps(body).encode(), head), timeout=20) as r:
+            if sid := r.headers.get("Mcp-Session-Id"):
+                head["Mcp-Session-Id"] = sid
+            text = r.read().decode("utf-8")
+        data = [line[6:] for line in text.splitlines() if line.startswith("data: ")]
+        return json.loads(data[-1] if data else text) if "id" in body else None
+
+    try:
+        call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "frugal", "version": "1"}}})
+        call({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        tools, cursor = [], None
+        while True:
+            res = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list", **({"params": {"cursor": cursor}} if cursor else {})})["result"]
+            tools += res["tools"]
+            if not (cursor := res.get("nextCursor")):
+                return tools
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def mcp_rules(servers):
+    """A delegate gets only the tools a server marks readOnlyHint and is denied the rest: it can read a ticket, never answer one.
+    Returns (allowed, denied, servers whose tools could not be listed)."""
+    allow, deny, failed = [], [], []
+    for name, conf in servers.items():
+        if not conf.get("url"):
+            allow.append(mcp_rule(name))  # frugal: a stdio server keeps all its tools; list them over stdio to make it read-only too
+            continue
+        tools = list_tools(conf)
+        if tools is None:
+            failed.append(name)
+            continue
+        for t in tools:
+            (allow if (t.get("annotations") or {}).get("readOnlyHint") else deny).append(mcp_rule(name, t["name"]))
+    return allow, deny, failed
+
+
+def clear_needs_auth(config_dir, names):
+    # Claude Code skips a server it marked as needing a login, even when frugal hands it this session's token.
+    p = Path(config_dir) / "mcp-needs-auth-cache.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if any(n in d for n in names):
+        p.write_text(json.dumps({k: v for k, v in d.items() if k not in names}), encoding="utf-8")
+
+
 def ready(accounts, now=None):
     now = time.time() if now is None else now
     return [a for a in accounts if a.get("enabled", True) and not a.get("needs_login") and a.get("exhausted_until", 0) <= now and not own(a)]
@@ -192,14 +274,13 @@ def blocked(a, data):
             and not data.get("opencode_allow_training", False))
 
 
-def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_names=()):
+def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=()):
     if a["kind"] == "claude" and kind == "note":
         return ["claude", "-p", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
-        # Claude Code names a server's tools mcp__<name>__<tool>, with characters outside [A-Za-z0-9_-] turned into _.
-        allowed = " ".join(["Bash Read Grep Glob" if kind in ("search", "run") else "Bash Read Grep Glob Edit Write",
-                            *(f"mcp__{re.sub(r'[^A-Za-z0-9_-]', '_', n)}" for n in mcp_names)])
+        allowed = " ".join(["Bash Read Grep Glob" if kind in ("search", "run") else "Bash Read Grep Glob Edit Write", *mcp_allow])
         tools = ["--allowedTools", allowed] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", allowed]
+        tools += ["--disallowedTools", " ".join(mcp_deny)] if mcp_deny else []
         # Strict: without it every delegated run starts all of the user's MCP servers (WSL, Python, Node) and leaves them running.
         return ["claude", "-p", "--model", model, "--effort", effort, *tools, "--strict-mcp-config", *(["--mcp-config", mcp_file] if mcp_file else [])]
     if a["kind"] == "grok":
@@ -319,7 +400,12 @@ def brief(text, kind, check, level, effort, cwd, mcp=()):
     found = session_mcp(cwd) if mcp else {}
     if (missing := [n for n in mcp if n not in found]):
         return f"frugal: this session has no MCP server named {', '.join(missing)}. Do it here."
-    servers = {n: found[n] for n in mcp}
+    servers, expired = with_auth({n: found[n] for n in mcp})
+    if expired:
+        return f"frugal: this session's login to {', '.join(expired)} expired; call one of its tools here once to refresh it, then delegate again."
+    allow, deny, failed = mcp_rules(servers)
+    if failed:
+        return f"frugal: could not list the tools of {', '.join(failed)} to keep the delegate read-only. Do it here."
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
     failure, tried, relog = "", [], []
     if check:
@@ -359,7 +445,9 @@ def brief(text, kind, check, level, effort, cwd, mcp=()):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump({"mcpServers": servers}, f)
         try:
-            code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, list(servers)), prompt, cwd, env, TIMEOUT.get(level, 600))
+            if servers and a.get("config_dir"):
+                clear_needs_auth(a["config_dir"], [n for n, c in servers.items() if c.get("url")])
+            code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, allow, deny), prompt, cwd, env, TIMEOUT.get(level, 600))
         finally:
             with LOCK:
                 BUSY[a["id"]] -= 1
@@ -849,13 +937,15 @@ def selftest():
         str(cfg).replace("\\", "/"): {"mcpServers": {"p": {"command": "b"}}}, "elsewhere": {"mcpServers": {"q": {"command": "c"}}}}}), encoding="utf-8")
     saved_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
-    a = argv_for(claude, "search", "sonnet", "low", (), "m.json", ["sm", "my server"])
+    a = argv_for(claude, "search", "sonnet", "low", (), "m.json", [mcp_rule("sm"), mcp_rule("my server")], [mcp_rule("py", "send reply")])
+    assert a[a.index("--disallowedTools") + 1] == "mcp__py__send_reply" and "--disallowedTools" not in argv_for(claude, "search", "sonnet", "low")
     assert a[-3:] == ["--strict-mcp-config", "--mcp-config", "m.json"] and "--strict-mcp-config" in argv_for(claude, "edit", "sonnet", "low") and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
     # delegate's check, with a stub agent that always claims success
     prompts, g = [], globals()
     real = {k: g[k] for k in ("run_cli", "load", "save")}
+    real_list_tools = list_tools
     g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
              load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None)
     envs = []
@@ -876,6 +966,19 @@ def selftest():
         # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
         os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
         assert set(session_mcp(str(cfg))) == {"sm", "p"}
+        (cfg / ".credentials.json").write_text(json.dumps({"mcpOAuth": {
+            "py|1": {"serverName": "py", "serverUrl": "https://p/", "accessToken": "tok", "refreshToken": "REFRESH", "expiresAt": 2000_000},
+            "old|1": {"serverName": "old", "serverUrl": "https://o/", "accessToken": "t2", "expiresAt": 1000_000}}}), encoding="utf-8")
+        s, exp = with_auth({"py": {"type": "http", "url": "https://p/"}, "old": {"url": "https://o/"}, "sm": {"command": "a"},
+                            "own": {"url": "https://p/", "headers": {"authorization": "x"}}}, now=1000)
+        assert s["py"]["headers"] == {"Authorization": "Bearer tok"} and "REFRESH" not in json.dumps(s) and exp == ["old"]
+        assert s["sm"] == {"command": "a"} and s["own"]["headers"] == {"authorization": "x"}
+        g["list_tools"] = lambda conf: None if "bad" in conf["url"] else [{"name": "get_x", "annotations": {"readOnlyHint": True}}, {"name": "send_x"}]
+        assert mcp_rules({"py": {"url": "https://p/"}, "sm": {"command": "a"}, "b": {"url": "https://bad/"}}) == (["mcp__py__get_x", "mcp__sm"], ["mcp__py__send_x"], ["b"])
+        g["list_tools"] = real_list_tools
+        (cfg / "mcp-needs-auth-cache.json").write_text(json.dumps({"py": {}, "x": {}}), encoding="utf-8")
+        clear_needs_auth(cfg, ["py"])
+        assert json.loads((cfg / "mcp-needs-auth-cache.json").read_text(encoding="utf-8")) == {"x": {}}
         g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (envs.append((argv[0], env, argv)), (0, "ok", ""))[1],
                  load=lambda: {"claude_only_mcp": ["serviceminder"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
         assert brief("look", "search", None, None, None, ".").startswith("Done by") and brief("note", "note", None, None, None, ".") == "ok"
