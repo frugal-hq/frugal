@@ -8,7 +8,7 @@ One file, stdlib only, four roles:
   server.py list | add <claude|codex|grok> <id> | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
 """
-import concurrent.futures, contextlib, datetime, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
+import concurrent.futures, contextlib, datetime, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
 from pathlib import Path
 
 HOME = Path.home()
@@ -652,8 +652,9 @@ def gate(event):
         count_read()
     elif tool == TOOL:
         s["delegated"] = s.get("delegated", 0) + 1
-    elif tool == "Agent" and not s.get("agent"):
-        s["agent"] = True
+    elif tool == "Agent" and (key := hashlib.sha1(inp.get("prompt", "").encode()).hexdigest()[:12]) not in s.get("agents", []):
+        # Per brief, like "waived": a session-wide flag let the rest of a parallel batch through after the first was sent back.
+        s["agents"] = [*s.get("agents", []), key][-20:]
         reason = (f"frugal: a subagent here runs on the main account. Give this to {TOOL} instead (one brief per piece in \"tasks\"). "
                   "If it needs this session's own tools, call again and it goes through.")
     DIR.mkdir(exist_ok=True)
