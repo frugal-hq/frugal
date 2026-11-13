@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.27.1-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.27.2-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
