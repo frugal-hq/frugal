@@ -525,7 +525,7 @@ SPEC = {
                    "test or build runs, edits you can brief exactly. Independent pieces go in \"tasks\" and run in parallel. "
                    "Keep design and the final check here; \"do it here\" means do it yourself.",
     "inputSchema": {"type": "object", "required": ["kind"], "properties": {
-        "task": {"type": "string", "description": "Goal, exact paths, done-when."},
+        "task": {"type": "string", "description": "Goal, exact paths, done-when. Optional with kind run."},
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
         "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
@@ -583,9 +583,13 @@ def system_dir(cwd):
 
 
 def delegate(args):
-    briefs = [*(args.get("tasks") or []), *([args["task"]] if args.get("task") else [])]
+    # A model reaches for "brief" or "prompt" first; each rejected call re-reads the whole context. A run needs only its check.
+    one = args.get("task") or args.get("brief") or args.get("prompt")
+    briefs = [*(args.get("tasks") or []), *([one] if one else [])]
+    if not briefs and args.get("kind") == "run" and args.get("check"):
+        briefs = ["Report each failure verbatim with its file:line."]
     if not briefs:
-        return "frugal: give a task or tasks."
+        return 'frugal: put the brief in "task", or independent briefs in "tasks".'
     cwd = work_dir(args)
     if system_dir(cwd):
         return f"frugal: this would run in {cwd}, where a secondary account cannot write. Delegate again with cwd set to the project folder."
@@ -735,7 +739,7 @@ def gate(event):
         cmd = inp.get("command", "")
         if heavy(cmd) and cmd not in s.get("waived", []):
             s["waived"] = [*s.get("waived", []), cmd][-20:]
-            reason = (f"frugal: send this to {TOOL} with kind \"run\", the exact command as \"check\" (with `set -o pipefail;` first if it pipes the run into tail or head) and a brief asking for the failures; "
+            reason = (f"frugal: send this to {TOOL} with kind \"run\" and the exact command as \"check\" (with `set -o pipefail;` first if it pipes the run into tail or head); no \"task\" needed; "
                       "it runs the command once in bash and returns its real exit code and output. If it says \"Do it here\", "
                       "run the same command again and it goes through.")
         elif reads_only(cmd):
@@ -1064,6 +1068,7 @@ def selftest():
         assert all(gate(ev)[0] is None for _ in range(EDIT_BUDGET)) and 'kind "edit"' in gate(ev)[0] and gate(ev) == (None, None)
         state(sid).write_text(json.dumps({"edits": EDIT_BUDGET, "delegated": 1}), encoding="utf-8")
         assert gate({**ev, "tool_name": "Write"}) == (None, None) and gate({**ev, "agent_id": "x"}) == (None, None)
+        assert delegate({"kind": "edit"}).startswith('frugal: put the brief in "task"')
     finally:
         globals()["active"] = was_active
         state(sid).unlink(missing_ok=True)
