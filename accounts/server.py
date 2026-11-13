@@ -171,7 +171,8 @@ def mcp_rule(server, tool=None):
 def list_tools(conf):
     """An HTTP MCP server's tools over streamable HTTP, or None when they cannot be listed."""
     import urllib.request
-    head = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **(conf.get("headers") or {})}
+    # Cloudflare's browser check (error 1010) refuses urllib's default Python-urllib agent.
+    head = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": "frugal", **(conf.get("headers") or {})}
 
     def call(body):
         with urllib.request.urlopen(urllib.request.Request(conf["url"], json.dumps(body).encode(), head), timeout=20) as r:
@@ -1024,6 +1025,31 @@ def selftest():
         assert system_dir(os.path.join(os.environ["SystemRoot"], "System32")) and not system_dir(d)
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
+    # MCP listing against a local server: Cloudflare (error 1010) refuses urllib's default agent, so it must send its own.
+    import http.server
+    agents = []
+
+    class Mcp(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            agents.append(self.headers.get("User-Agent"))
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            reply = json.dumps({"jsonrpc": "2.0", "id": body.get("id"), "result": {"tools": [{"name": "get_x"}]}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    mcp = http.server.HTTPServer(("127.0.0.1", 0), Mcp)
+    threading.Thread(target=mcp.serve_forever, daemon=True).start()
+    try:
+        assert list_tools({"url": f"http://127.0.0.1:{mcp.server_port}/"}) == [{"name": "get_x"}]
+        assert agents == ["frugal"] * 3
+    finally:
+        mcp.shutdown()
     # delegate's check, with a stub agent that always claims success
     prompts, g = [], globals()
     real = {k: g[k] for k in ("run_cli", "load", "save")}
