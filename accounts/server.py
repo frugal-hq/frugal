@@ -507,7 +507,7 @@ SPEC = {
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
         "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once."},
-        "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the session's project dir."},
+        "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the folder the check starts with `cd` into, else the session's project dir. Set it when the work is outside the project."},
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
         "mcp": {"type": "array", "items": {"type": "string"},
@@ -541,11 +541,32 @@ def run_job(b, args, cwd):
         log_job({**job, "status": outcome(text, job) if text else "failed", "end": time.time(), "result": (text or "")[:300]})
 
 
+def work_dir(args):
+    """The cwd given, else the folder a check starts with `cd <dir> &&`, else the session's project dir."""
+    if args.get("cwd"):
+        return args["cwd"]
+    if m := re.match(r"""\s*cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)\s*&&""", args.get("check") or ""):
+        d = os.path.expanduser(m.group(1).strip("\"'"))
+        if os.name == "nt":
+            d = re.sub(r"^/([a-zA-Z])(/|$)", r"\1:/", d)  # Git Bash's /d/x is D:/x
+        if os.path.isdir(d):
+            return d
+    return os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+
+
+def system_dir(cwd):
+    # An elevated shell starts in C:\Windows\System32: an account working there can write neither there nor in the project.
+    root = os.environ.get("SystemRoot")
+    return bool(root) and Path(cwd).resolve().is_relative_to(Path(root).resolve())
+
+
 def delegate(args):
     briefs = [*(args.get("tasks") or []), *([args["task"]] if args.get("task") else [])]
     if not briefs:
         return "frugal: give a task or tasks."
-    cwd = args.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    cwd = work_dir(args)
+    if system_dir(cwd):
+        return f"frugal: this would run in {cwd}, where a secondary account cannot write. Delegate again with cwd set to the project folder."
     with concurrent.futures.ThreadPoolExecutor(len(briefs)) as ex:
         out = list(ex.map(lambda b: run_job(b, args, cwd), briefs))
     return out[0] if len(out) == 1 else "\n\n".join(f"## Task {i}\n{r}" for i, r in enumerate(out, 1))
@@ -977,6 +998,12 @@ def selftest():
     a = argv_for(claude, "search", "sonnet", "low", (), "m.json", [mcp_rule("sm"), mcp_rule("my server")], [mcp_rule("py", "send reply")])
     assert a[a.index("--disallowedTools") + 1] == "mcp__py__send_reply" and "--disallowedTools" not in argv_for(claude, "search", "sonnet", "low")
     assert a[-3:] == ["--strict-mcp-config", "--mcp-config", "m.json"] and "--strict-mcp-config" in argv_for(claude, "edit", "sonnet", "low") and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
+    d = tempfile.mkdtemp()
+    assert work_dir({"cwd": "x", "check": f"cd {d} && t"}) == "x" and work_dir({"check": f'cd "{d}" && t'}) == d and work_dir({"check": f"cd {d}; t"}) != d
+    assert work_dir({"check": "cd /nonexistent-dir-xyz && t"}) == (os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    if os.name == "nt":
+        assert Path(work_dir({"check": "cd /" + d[0].lower() + d[2:].replace("\\", "/") + " && t"})) == Path(d)
+        assert system_dir(os.path.join(os.environ["SystemRoot"], "System32")) and not system_dir(d)
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
     # delegate's check, with a stub agent that always claims success
