@@ -205,6 +205,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.27.6**: The fourth edit in a prompt that has not delegated goes to `delegate` once, as kind `edit`, with a brief, a check and a diff review here; calling again goes through. Across 31,524 past prompts, 1,340 made more than three edits and only 51 of them delegated.
 - **0.27.5**: The heavy-command hook no longer sends reads to delegate: quoted text (a commit message, a `node -e` script), Gradle file and folder names (`gradle.properties`, `build.gradle.kts`, `./gradle`) and lookups (`which tsc`) no longer count as runs. Replayed on 4,874 real commands it cut 29 false positives and lost no real run. A piped check notes that its exit code is the last stage's.
 - **0.27.4**: MCP tools are listed with a `frugal` user agent, so a server behind Cloudflare's browser check (error 1010) no longer refuses the listing and blocks every delegate that names it.
 - **0.27.3**: `delegate` without `cwd` runs in the folder its check starts with `cd` into, and refuses to run under `C:\Windows`, where an elevated session starts and no secondary account can write. A server whose tools cannot be listed is asked twice, then its last listed tools are used, so a delegate stays read-only while the server connects.

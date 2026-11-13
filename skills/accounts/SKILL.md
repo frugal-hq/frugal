@@ -5,7 +5,7 @@ description: Set up secondary Claude, Codex, Grok or OpenCode accounts that take
 
 # frugal: secondary accounts
 
-Accounts live in `~/.frugal/accounts.json`. While it lists at least one account, frugal exposes the `delegate` tool, adds the delegation rule to each prompt, and sends test runs, long explorations and subagents to those accounts. With none, nothing changes.
+Accounts live in `~/.frugal/accounts.json`. While it lists at least one account, frugal exposes the `delegate` tool, adds the delegation rule to each prompt, and sends test runs, long explorations, long edit runs and subagents to those accounts. With none, nothing changes.
 
 Run the matching command with Bash and show its output; `<base>` is this skill's base directory.
 
