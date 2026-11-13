@@ -39,7 +39,7 @@ LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|quota|to
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
 AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oauth token (has )?(expired|been revoked)"
                   r"|invalid (api|x-api) key|authentication_error|not authenticated|not signed in|login required", re.I)
-HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|\b(pytest|jest|vitest|tsc|gradlew?|mvn)\b|\bpython\S*\s+\S*bench\.py\b"
+HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|(?<![.\w-])(pytest|jest|vitest|tsc|gradlew|mvn)(\.(bat|cmd|exe))?(?![.\w/-])|(?<![.\w/\\-])gradle(?![.\w/-])|\bpython\S*\s+\S*bench\.py\b"
                        r"|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b", re.I)
 CODEX_RULES = (
     "Work rules: report results, not process; no filler, preamble or closing summary. Keep exact terms, code, commands, errors, "
@@ -682,8 +682,22 @@ def nudge(reads, delegated, ids):
     return ""
 
 
+QUOTED = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
+SHELL_C = re.compile(r"\b(bash|sh|zsh|pwsh|powershell|cmd)(\.exe)?\s+([-/]\w+\s+)*?([-/]c|-command)\s*$", re.I)
+
+
+def unquoted(cmd):
+    """The command with quoted arguments blanked: a commit message or an inline script's text is data. A quoted program, or the code
+    after bash -c, cmd /c or -Command, still runs."""
+    def keep(m):
+        before = cmd[:m.start()]
+        return m.group(0) if not before.strip() or re.search(r"(&&|\|\||[;|&(\n])[ \t]*$", before) or SHELL_C.search(before) else '""'
+    # A lookup (which tsc, Get-Command cargo) names a tool without running it.
+    return re.sub(r"\b(which|where\.exe|command\s+-v|Get-Command|gcm)\s+[^;&|\n]*", "", QUOTED.sub(keep, cmd), flags=re.I)
+
+
 def heavy(cmd):
-    head = re.split(r"<<-?\s*['\"]?\w+", cmd)[0]  # a heredoc body is data, not a command run here
+    head = unquoted(re.split(r"<<-?\s*['\"]?\w+", cmd)[0])  # a heredoc body is data, not a command run here
     # ssh runs on another machine and may change it there or prompt for a key; CLAUDE_CONFIG_DIR= already uses another account
     return bool(HEAVY_RUN.search(head)) and not re.search(r"\bssh\s", head) and "CLAUDE_CONFIG_DIR=" not in head
 
@@ -1025,6 +1039,11 @@ def selftest():
         assert system_dir(os.path.join(os.environ["SystemRoot"], "System32")) and not system_dir(d)
     assert heavy("cd x && npm test") and not heavy("python - <<'EOF'\nnpm test\nEOF")
     assert heavy("python bench.py run") and not heavy("cat core.md && grep -n t8 bench.py") and not heavy("ssh vps 'cd app && go test ./...'")
+    assert not heavy("git commit -m \"fix: npm test flake\"") and not heavy("node -e \"s = s.replace('cargo test', x)\" && git diff --stat")
+    assert heavy("bash -c 'npm test'") and heavy("cmd /c \"cargo build\"") and heavy("cd \"C:\\My Dir\" && cargo test") and heavy("echo 'x' ; npm test")
+    assert not heavy("cat build.gradle.kts gradle.properties jest.config.js; ls ~/.gradle/caches") and not heavy("which tsc npx 2>&1 | head -2")
+    assert not heavy("cat gradle.properties | head; find . -path ./gradle -prune -o -name \"*.yml\" -print") and heavy("gradle build")
+    assert heavy("./gradlew.bat -q compileJava") and heavy("S=\"x\"\nnpx -y -p typescript tsc -p \"$S\"") and heavy("node_modules/.bin/jest")
     # MCP listing against a local server: Cloudflare (error 1010) refuses urllib's default agent, so it must send its own.
     import http.server
     agents = []
