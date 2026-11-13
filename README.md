@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.27.3-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.27.4-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
@@ -205,6 +205,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.27.4**: MCP tools are listed with a `frugal` user agent, so a server behind Cloudflare's browser check (error 1010) no longer refuses the listing and blocks every delegate that names it.
 - **0.27.3**: `delegate` without `cwd` runs in the folder its check starts with `cd` into, and refuses to run under `C:\Windows`, where an elevated session starts and no secondary account can write. A server whose tools cannot be listed is asked twice, then its last listed tools are used, so a delegate stays read-only while the server connects.
 - **0.27.2**: each delegated brief adds a line to `~/.frugal/jobs.jsonl` when it starts and when it ends, with the session, account, model, cost (Claude accounts) and outcome: done, failed or not delegated. Frugal Deck shows them in the chat's details panel.
 - **0.27.1**: with secondary accounts, each subagent brief goes to `delegate` once, so every subagent of a parallel batch gets the same note; before, only the first of the session did and the rest ran on the main account. A second call with the same brief goes through.
