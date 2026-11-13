@@ -94,6 +94,7 @@ Add and login verify the signed-in email before an account joins the pool. From 
 
 - The `delegate` tool runs each brief on the least-used account, in parallel for independent pieces, and moves to the next account when one hits its limit.
 - Each provider gets its own model and effort per level: Claude `haiku`/`sonnet`/`opus` with low to max effort, Codex `gpt-6-luna`/`gpt-6.1-sol`/`gpt-6-astra` (only models the login lists) with low to xhigh, Grok `grok-4.6` with low to xhigh, OpenCode the account's one model. Work defaults to the standard level (`sonnet`, medium).
+- Heavy and max work goes to Claude secondaries first, then Codex, then Grok, and never to OpenCode; lighter work goes to the least used account.
 - A hook adds the delegation rule to the first prompt, and to a later one only when the prompt before it ran more than 5 reads or searches here and delegated nothing. Another sends test and build runs and subagents to `delegate` once (asking again runs them here); a sixth read or search in one prompt (shell commands that only read, such as `cat`, `grep` or `git log`, count too) still runs, with a note to hand the rest to `delegate`.
 - Each delegated run gets 10 minutes, 20 at the heavy level and 30 at max.
 - A logged-out account leaves the pool, and each prompt names the command to sign it in again (`/frugal:accounts login <id>`).
@@ -205,6 +206,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.27.8**: Heavy and max delegate work goes to Claude secondaries first, then Codex, then Grok; free OpenCode models now take only light and standard work. Before, the least used account took it, so a heavy edit could land on a small free model.
 - **0.27.7**: `delegate` takes the brief as `task`, `brief` or `prompt`, and a `run` needs only its `check`: each rejected call re-read the whole context. The heavy-command note no longer asks for "a brief". Edits to the session's own memory, plans, settings and scratchpad no longer count toward the edit budget.
 - **0.27.6**: The fourth edit in a prompt that has not delegated goes to `delegate` once, as kind `edit`, with a brief, a check and a diff review here; calling again goes through. Across 31,524 past prompts, 1,340 made more than three edits and only 51 of them delegated.
 - **0.27.5**: The heavy-command hook no longer sends reads to delegate: quoted text (a commit message, a `node -e` script), Gradle file and folder names (`gradle.properties`, `build.gradle.kts`, `./gradle`) and lookups (`which tsc`) no longer count as runs. Replayed on 4,874 real commands it cut 29 false positives and lost no real run. A piped check notes that its exit code is the last stage's.
