@@ -19,7 +19,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell|Read|Grep|Glob|Agent|mcp__plugin_frugal_accounts__delegate",
+        "matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Agent|mcp__plugin_frugal_accounts__delegate",
         "hooks": [
           {
             "type": "command",

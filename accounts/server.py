@@ -3,7 +3,7 @@
 One file, stdlib only, four roles:
   server.py                 MCP server (stdio) exposing `delegate` while an account is set up
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
-  server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too) and subagents to delegate
+  server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
   server.py list | add <claude|codex|grok> <id> | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
@@ -49,6 +49,9 @@ CODEX_RULES = (
     "security or error handling that prevents data loss."
 )
 EXPLORE_BUDGET = 5
+# Edits per prompt before the next one goes to delegate: of 31,524 prompts, 1,340 made more than 3 (93% across 2+ files) and 51 delegated.
+EDIT_BUDGET = 3
+EDITS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 # Shell commands that only read. A chain of them counts against EXPLORE_BUDGET as Read and Grep do: in one day 816 shell reads went uncounted.
 READ_ONLY = re.compile(r"(cat|head|tail|less|grep|egrep|fgrep|rg|ls|dir|find|tree|wc|stat|file|du|awk|sed|jq|sort|uniq|cut|column|nl|diff|cmp"
                        r"|basename|dirname|realpath|which|where|git\s+(log|show|diff|status|grep|ls-files|blame|branch|rev-parse)"
@@ -667,7 +670,7 @@ def rule(event):
     ids = ", ".join(a["id"] for a in ready(load()["accounts"]))
     first = s.get("announced") != ids
     DIR.mkdir(exist_ok=True)
-    state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "delegated": 0, "agent": False}), encoding="utf-8")
+    state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "edits": 0, "delegated": 0, "agent": False}), encoding="utf-8")
     if first:
         return (f"frugal: secondary accounts {ids} are set up. Delegate every bounded task with {TOOL}, level per task; "
                 "keep here only design, judgment calls and the final check.")
@@ -739,6 +742,14 @@ def gate(event):
             count_read()
     elif tool in ("Read", "Grep", "Glob"):
         count_read()
+    elif tool in EDITS:
+        # Once per prompt: the retry counts again and goes through, and a prompt that already delegated is left alone.
+        s["edits"] = s.get("edits", 0) + 1
+        if s["edits"] == EDIT_BUDGET + 1 and not s.get("delegated"):
+            reason = (f"frugal: {EDIT_BUDGET} edits here this prompt already. Hand the remaining edits to {TOOL} with kind \"edit\" "
+                      "(level \"heavy\" for multi-file work): name the files, the exact change and what is already done, and give a check "
+                      "command that proves it (build, test). Then review its diff here. If the rest depends on judgment only this "
+                      "conversation has, call again and it goes through.")
     elif tool == TOOL:
         s["delegated"] = s.get("delegated", 0) + 1
     elif tool == "Agent" and (key := hashlib.sha1(inp.get("prompt", "").encode()).hexdigest()[:12]) not in s.get("agents", []):
@@ -1044,6 +1055,18 @@ def selftest():
     assert not heavy("cat build.gradle.kts gradle.properties jest.config.js; ls ~/.gradle/caches") and not heavy("which tsc npx 2>&1 | head -2")
     assert not heavy("cat gradle.properties | head; find . -path ./gradle -prune -o -name \"*.yml\" -print") and heavy("gradle build")
     assert heavy("./gradlew.bat -q compileJava") and heavy("S=\"x\"\nnpx -y -p typescript tsc -p \"$S\"") and heavy("node_modules/.bin/jest")
+    # edits: the one past the budget goes to delegate once per prompt, and never after this prompt delegated
+    was_active, sid = globals()["active"], "selftest-edits"
+    globals()["active"] = lambda: True
+    try:
+        state(sid).write_text(json.dumps({"edits": 0}), encoding="utf-8")
+        ev = {"session_id": sid, "tool_name": "Edit", "tool_input": {"file_path": "a"}}
+        assert all(gate(ev)[0] is None for _ in range(EDIT_BUDGET)) and 'kind "edit"' in gate(ev)[0] and gate(ev) == (None, None)
+        state(sid).write_text(json.dumps({"edits": EDIT_BUDGET, "delegated": 1}), encoding="utf-8")
+        assert gate({**ev, "tool_name": "Write"}) == (None, None) and gate({**ev, "agent_id": "x"}) == (None, None)
+    finally:
+        globals()["active"] = was_active
+        state(sid).unlink(missing_ok=True)
     # MCP listing against a local server: Cloudflare (error 1010) refuses urllib's default agent, so it must send its own.
     import http.server
     agents = []
