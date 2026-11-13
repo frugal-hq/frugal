@@ -56,6 +56,7 @@ READ_ONLY = re.compile(r"(cat|head|tail|less|grep|egrep|fgrep|rg|ls|dir|find|tre
 NEUTRAL = re.compile(r"(cd|echo|printf|true)(\s|$)")
 TIMEOUT = {"heavy": 1200, "max": 1800}  # seconds per agent run; heavy edits ran past 10 minutes and started over
 HEADS_UP = DIR / "heads-up.json"
+JOBS = DIR / "jobs.jsonl"  # one line per delegated brief as it starts and ends; Frugal Deck's details panel reads it
 HEADS_UP_CALLS = 6  # tool calls in a turn before the side agent looks; shorter turns are not worth a check
 HEADS_UP_MAX = 4  # notes per session, as in Claude Code's own "You should know"
 HEADS_UP_CHECKS = 8  # checks per session: each one costs the secondary account, and a spent account leaves delegate for an hour
@@ -276,13 +277,13 @@ def blocked(a, data):
 
 def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=()):
     if a["kind"] == "claude" and kind == "note":
-        return ["claude", "-p", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
+        return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
         allowed = " ".join(["Bash Read Grep Glob" if kind in ("search", "run") else "Bash Read Grep Glob Edit Write", *mcp_allow])
         tools = ["--allowedTools", allowed] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", allowed]
         tools += ["--disallowedTools", " ".join(mcp_deny)] if mcp_deny else []
         # Strict: without it every delegated run starts all of the user's MCP servers (WSL, Python, Node) and leaves them running.
-        return ["claude", "-p", "--model", model, "--effort", effort, *tools, "--strict-mcp-config", *(["--mcp-config", mcp_file] if mcp_file else [])]
+        return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, *tools, "--strict-mcp-config", *(["--mcp-config", mcp_file] if mcp_file else [])]
     if a["kind"] == "grok":
         # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
@@ -374,7 +375,7 @@ def do_here(check, code, out):
             "Do it here: run the same command again in your shell and it goes through.")
 
 
-def run_brief(text, check, level, effort, cwd):
+def run_brief(text, check, level, effort, cwd, job):
     # The check runs once, here; its exit code and output are the result. An agent only explains a failure, from that output.
     code, out = run_check(check, cwd)
     if env_failure(code, out):
@@ -383,7 +384,7 @@ def run_brief(text, check, level, effort, cwd):
         return f"frugal: check `{check}` exited 0, passed:\n{out[-300:]}"
     notes = brief(f"{text}\n\nThe command `{check}` already ran and exited {code}. The end of its output:\n{out[-8000:]}\n\n"
                   "Find the cause of each failure from this output and the code. Do not run the command again.",
-                  "search", None, level, effort, cwd)
+                  "search", None, level, effort, cwd, job=job)
     return f"frugal: check `{check}` exited {code}, failed:\n{out[-800:]}\n\nAgent notes, not a test result:\n{notes}"
 
 
@@ -394,9 +395,10 @@ def relogin(ids):
     return "".join(f"frugal: secondary account {i} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
 
 
-def brief(text, kind, check, level, effort, cwd, mcp=()):
+def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
+    job = {} if job is None else job  # filled with the account, model and cost of the last try
     if check and kind == "run":
-        return run_brief(text, check, level, effort, cwd)
+        return run_brief(text, check, level, effort, cwd, job)
     found = session_mcp(cwd) if mcp else {}
     if (missing := [n for n in mcp if n not in found]):
         return f"frugal: this session has no MCP server named {', '.join(missing)}. Do it here."
@@ -423,6 +425,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=()):
             BUSY[a["id"]] = BUSY.get(a["id"], 0) + 1
         tried.append(a["id"])
         model, eff = choose(a, kind, level, effort)
+        job.update(account=a["id"], model=model)
         prompt = (f"{text}\n\nA previous attempt failed: {failure}" if failure else text) + \
             ("" if raw else "\n\nReply in under 150 words: what you found or changed, with file paths.")
         if raw:
@@ -453,6 +456,13 @@ def brief(text, kind, check, level, effort, cwd, mcp=()):
                 BUSY[a["id"]] -= 1
             if mcp_file:
                 os.unlink(mcp_file)
+        if a["kind"] == "claude":  # --output-format json: the reply and what the run cost
+            try:
+                j = json.loads(out)
+                job["cost"] = job.get("cost", 0) + (j.get("total_cost_usd") or 0)
+                out, err = ("", err or j.get("result", "")) if j.get("is_error") else (j.get("result") or "", err)
+            except (ValueError, AttributeError):
+                pass
         with LOCK, file_lock():
             data = load()
             for x in data["accounts"]:
@@ -506,13 +516,38 @@ SPEC = {
 }
 
 
+def log_job(entry):
+    # frugal: the file only grows; trim it to the last few thousand lines once it gets large.
+    with LOCK, file_lock(), open(JOBS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def outcome(text, job):
+    if re.search(r"^(Done by |frugal: check `.*` exited 0, passed)", text, re.M):
+        return "done"
+    return "failed" if job.get("account") else "not delegated"
+
+
+def run_job(b, args, cwd):
+    kind = args.get("kind", "search")
+    job = {"id": os.urandom(6).hex(), "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "cwd": cwd, "kind": kind,
+           "brief": b.strip().split("\n")[0][:200], "start": time.time()}
+    log_job({**job, "status": "running"})
+    text = None
+    try:
+        text = brief(b, kind, args.get("check"), args.get("level"), args.get("effort"), cwd, args.get("mcp") or (), job)
+        return text
+    finally:
+        log_job({**job, "status": outcome(text, job) if text else "failed", "end": time.time(), "result": (text or "")[:300]})
+
+
 def delegate(args):
     briefs = [*(args.get("tasks") or []), *([args["task"]] if args.get("task") else [])]
     if not briefs:
         return "frugal: give a task or tasks."
     cwd = args.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     with concurrent.futures.ThreadPoolExecutor(len(briefs)) as ex:
-        out = list(ex.map(lambda b: brief(b, args.get("kind", "search"), args.get("check"), args.get("level"), args.get("effort"), cwd, args.get("mcp") or ()), briefs))
+        out = list(ex.map(lambda b: run_job(b, args, cwd), briefs))
     return out[0] if len(out) == 1 else "\n\n".join(f"## Task {i}\n{r}" for i, r in enumerate(out, 1))
 
 
@@ -965,6 +1000,12 @@ def selftest():
         assert "exited 127" in r and "Do it here" in r and len(prompts) == n, r
         r = brief("fix x", "edit", "echo nope; exit 1", None, None, ".")  # a failing check never reads as passed
         assert "passed" not in r and "Do it here" in r, r
+        # a Claude account answers in JSON: the reply is its result and the job keeps the cost
+        g["run_cli"] = lambda argv, prompt, cwd, env, timeout=600: (0, json.dumps({"result": "found it", "total_cost_usd": 0.25}), "")
+        job = {}
+        r = brief("look", "search", None, None, None, ".", job=job)
+        assert r.endswith("found it") and job["cost"] == 0.25 and job["account"] == "stub" and outcome(r, job) == "done", (r, job)
+        assert outcome("frugal: no secondary account finished this. Do it here.", {}) == "not delegated"
         # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
         os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
         assert set(session_mcp(str(cfg))) == {"sm", "p"}
