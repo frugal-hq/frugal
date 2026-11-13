@@ -52,6 +52,8 @@ EXPLORE_BUDGET = 5
 # Edits per prompt before the next one goes to delegate: of 31,524 prompts, 1,340 made more than 3 (93% across 2+ files) and 51 delegated.
 EDIT_BUDGET = 3
 EDITS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# The session's own notes (memory, plans, settings under .claude*) and its scratchpad are not delegable work.
+OWN_FILE = re.compile(r"[\\/](\.claude[^\\/]*|Temp[\\/]claude)[\\/]", re.I)
 # Shell commands that only read. A chain of them counts against EXPLORE_BUDGET as Read and Grep do: in one day 816 shell reads went uncounted.
 READ_ONLY = re.compile(r"(cat|head|tail|less|grep|egrep|fgrep|rg|ls|dir|find|tree|wc|stat|file|du|awk|sed|jq|sort|uniq|cut|column|nl|diff|cmp"
                        r"|basename|dirname|realpath|which|where|git\s+(log|show|diff|status|grep|ls-files|blame|branch|rev-parse)"
@@ -746,13 +748,13 @@ def gate(event):
             count_read()
     elif tool in ("Read", "Grep", "Glob"):
         count_read()
-    elif tool in EDITS:
+    elif tool in EDITS and not OWN_FILE.search(inp.get("file_path") or inp.get("notebook_path") or ""):
         # Once per prompt: the retry counts again and goes through, and a prompt that already delegated is left alone.
         s["edits"] = s.get("edits", 0) + 1
         if s["edits"] == EDIT_BUDGET + 1 and not s.get("delegated"):
             reason = (f"frugal: {EDIT_BUDGET} edits here this prompt already. Hand the remaining edits to {TOOL} with kind \"edit\" "
-                      "(level \"heavy\" for multi-file work): name the files, the exact change and what is already done, and give a check "
-                      "command that proves it (build, test). Then review its diff here. If the rest depends on judgment only this "
+                      "(level \"heavy\" for multi-file work): in \"task\" name the files, the exact change and what is already done; in \"check\" "
+                      "a command that proves it (build, test). Then review its diff here. If the rest depends on judgment only this "
                       "conversation has, call again and it goes through.")
     elif tool == TOOL:
         s["delegated"] = s.get("delegated", 0) + 1
@@ -1068,6 +1070,10 @@ def selftest():
         assert all(gate(ev)[0] is None for _ in range(EDIT_BUDGET)) and 'kind "edit"' in gate(ev)[0] and gate(ev) == (None, None)
         state(sid).write_text(json.dumps({"edits": EDIT_BUDGET, "delegated": 1}), encoding="utf-8")
         assert gate({**ev, "tool_name": "Write"}) == (None, None) and gate({**ev, "agent_id": "x"}) == (None, None)
+        state(sid).write_text(json.dumps({"edits": EDIT_BUDGET}), encoding="utf-8")
+        assert gate({**ev, "tool_input": {"file_path": "C:\\Users\\u\\.claude-x\\projects\\p\\memory\\m.md"}}) == (None, None)
+        assert gate({**ev, "tool_input": {"file_path": "C:\\Users\\u\\AppData\\Local\\Temp\\claude\\a\\b\\scratchpad\\t.js"}}) == (None, None)
+        assert 'in "task"' in gate(ev)[0]
         assert delegate({"kind": "edit"}).startswith('frugal: put the brief in "task"')
     finally:
         globals()["active"] = was_active
