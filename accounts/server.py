@@ -525,7 +525,7 @@ SPEC = {
         "task": {"type": "string", "description": "Goal, exact paths, done-when."},
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
-        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once."},
+        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
         "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the folder the check starts with `cd` into, else the session's project dir. Set it when the work is outside the project."},
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
@@ -732,7 +732,7 @@ def gate(event):
         cmd = inp.get("command", "")
         if heavy(cmd) and cmd not in s.get("waived", []):
             s["waived"] = [*s.get("waived", []), cmd][-20:]
-            reason = (f"frugal: send this to {TOOL} with kind \"run\", the exact command as \"check\" and a brief asking for the failures; "
+            reason = (f"frugal: send this to {TOOL} with kind \"run\", the exact command as \"check\" (with `set -o pipefail;` first if it pipes the run into tail or head) and a brief asking for the failures; "
                       "it runs the command once in bash and returns its real exit code and output. If it says \"Do it here\", "
                       "run the same command again and it goes through.")
         elif reads_only(cmd):
