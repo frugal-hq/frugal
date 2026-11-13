@@ -273,9 +273,16 @@ def choose(a, kind, level=None, effort=None):
     return model, fit(effort or base, rule["efforts"])
 
 
-def order(accounts, busy):
+STRONG = {"claude": 0, "codex": 1, "grok": 2}  # heavy and max: Claude secondaries, then GPT-6.1 Sol, then Grok 4.6; free OpenCode models never
+
+
+def order(accounts, busy, level=None):
     day = today()
-    return sorted(ready(accounts), key=lambda a: busy.get(a["id"], 0) * 1000 + (a.get("used", 0) if a.get("day") == day else 0))
+    pool = ready(accounts)
+    if level in ("heavy", "max"):
+        pool = [a for a in pool if a["kind"] in STRONG]
+    rank = (lambda a: STRONG[a["kind"]]) if level in ("heavy", "max") else (lambda a: 0)
+    return sorted(pool, key=lambda a: (rank(a), busy.get(a["id"], 0) * 1000 + (a.get("used", 0) if a.get("day") == day else 0)))
 
 
 def codex_models():
@@ -441,7 +448,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             data = load()
             # A heads-up note carries the session transcript, which never goes to Grok or OpenCode.
             # A task that needs this session's MCP servers goes only to Claude accounts.
-            pool = [a for a in order(data["accounts"], BUSY) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode"))
+            pool = [a for a in order(data["accounts"], BUSY, level) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode"))
                     and not (servers and a["kind"] != "claude") and not blocked(a, data)]
             if not pool:
                 break
@@ -999,6 +1006,8 @@ def selftest():
     os.environ.update({k: v for k, v in saved.items() if v is not None})
     assert AUTH.search("API Error: 401 OAuth token has expired") and AUTH.search("Please run /login") and not AUTH.search("ok")
     assert [a["id"] for a in order(pool, {"old": 1})] == ["b", "a", "old"]
+    mixed = [{"id": "o", "kind": "opencode"}, {"id": "g", "kind": "grok"}, {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude", "used": 9, "day": today()}]
+    assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["c", "x", "g"] and order(mixed, {}, "standard")[0]["id"] == "o"
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
     assert argv_for(codex, "run", None, "low")[-3:] == ["-s", "workspace-write", "-"]
     assert argv_for(claude, "note", "sonnet", "medium")[-3:] == ["--tools", "", "--strict-mcp-config"]
