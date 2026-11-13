@@ -327,28 +327,67 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mc
     return ["codex", "exec", "--skip-git-repo-check", *(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}", *off, *sandbox, "-"]
 
 
+class Cancelled(Exception):
+    pass
+
+
+# One per tools/call: the processes it runs, so a cancel or the end of the session kills them, and the jobs its progress names.
+class Request:
+    def __init__(self):
+        self.lock, self.cancelled, self.procs, self.jobs = threading.Lock(), False, set(), []
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled, procs = True, list(self.procs)
+        for p in procs:
+            kill_tree(p)
+
+
+TL = threading.local()  # .req: the Request this thread works for; unset in hooks and the CLI
+
+
+def kill_tree(p):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def run_tree(cmd, timeout, input=None, **kw):
     # On timeout kill the whole tree: subprocess.run kills only the .cmd shim or shell, and the
     # grandchild keeps the pipes open, so communicate() never returns. None means timed out.
     # Never inherit stdin: in the MCP server it carries the protocol, and a command that reads it would eat requests.
+    req = getattr(TL, "req", None)
+    if req and req.cancelled:
+        raise Cancelled
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt", **kw)
+    if req:
+        with req.lock:
+            req.procs.add(p)
+            dead = req.cancelled
+        if dead:
+            kill_tree(p)
     try:
         out, err = p.communicate(input, timeout=timeout)
-        return p.returncode, out, err
+        result = p.returncode, out, err
     except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
-        else:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        kill_tree(p)
         try:
             p.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             pass  # a process that escaped the tree still holds the pipes; give up on it
-        return None
+        result = None
+    finally:
+        if req:
+            with req.lock:
+                req.procs.discard(p)
+    if req and req.cancelled:
+        raise Cancelled  # stops the retries too: every try and check runs through here
+    return result
 
 
 def run_cli(argv, prompt, cwd, env, timeout=600):
@@ -564,12 +603,15 @@ def run_job(b, args, cwd):
     job = {"id": os.urandom(6).hex(), "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "cwd": cwd, "kind": kind,
            "brief": b.strip().split("\n")[0][:200], "start": time.time()}
     log_job({**job, "status": "running"})
+    if (req := getattr(TL, "req", None)):
+        req.jobs.append(job)
     text = None
     try:
         text = brief(b, kind, args.get("check"), args.get("level"), args.get("effort"), cwd, args.get("mcp") or (), job)
         return text
     finally:
-        log_job({**job, "status": outcome(text, job) if text else "failed", "end": time.time(), "result": (text or "")[:300]})
+        status = "cancelled" if req and req.cancelled else outcome(text, job) if text else "failed"
+        log_job({**job, "status": status, "end": time.time(), "result": (text or "")[:300]})
 
 
 def work_dir(args):
@@ -602,44 +644,89 @@ def delegate(args):
     cwd = work_dir(args)
     if system_dir(cwd):
         return f"frugal: this would run in {cwd}, where a secondary account cannot write. Delegate again with cwd set to the project folder."
+    req = getattr(TL, "req", None)
+
+    def work(b):
+        TL.req = req  # pool threads start without it
+        return run_job(b, args, cwd)
+
     with concurrent.futures.ThreadPoolExecutor(len(briefs)) as ex:
-        out = list(ex.map(lambda b: run_job(b, args, cwd), briefs))
+        out = list(ex.map(work, briefs))
     return out[0] if len(out) == 1 else "\n\n".join(f"## Task {i}\n{r}" for i, r in enumerate(out, 1))
 
 
-def serve():
-    def send(msg):
-        sys.stdout.write(json.dumps(msg) + "\n")
-        sys.stdout.flush()
+PROGRESS_EVERY = 15  # seconds between progress notifications; they also tell a client that resets its timeout on progress that the call is alive
 
-    for line in sys.stdin:
+
+def progress_message(req, start):
+    names = ", ".join(dict.fromkeys(j.get("account") or "starting" for j in req.jobs)) or "starting"
+    return f"{names}: {int(time.time() - start) // 60} min"
+
+
+def serve(inp=None, outp=None):
+    # Each tools/call runs in its own thread, so the loop keeps reading: pings, cancellations, and the end of the session.
+    inp, outp, out_lock, live = inp or sys.stdin, outp or sys.stdout, threading.Lock(), {}
+
+    def send(msg):
+        with out_lock:
+            outp.write(json.dumps(msg) + "\n")
+            outp.flush()
+
+    def beat(req, token, done):
+        start, n = time.time(), 0
+        while not done.wait(PROGRESS_EVERY):
+            n += 1
+            send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": token, "progress": n, "message": progress_message(req, start)}})
+
+    def call(rid, p, req):
+        TL.req, done = req, threading.Event()
+        token = (p.get("_meta") or {}).get("progressToken")
+        beater = threading.Thread(target=beat, args=(req, token, done), daemon=True) if token is not None else None
+        if beater:
+            beater.start()
         try:
-            req = json.loads(line)
+            text = delegate(p.get("arguments") or {}) if p.get("name") == "delegate" and active() else "frugal: no secondary account is set up."
+        except Cancelled:
+            text = None
+        except Exception as e:  # one bad call must not close the server for the rest of the session
+            with open(DIR / "errors.log", "a", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+            text = f"frugal: delegate failed ({type(e).__name__}: {e}). Do it here."
+        finally:
+            done.set()
+            if beater:
+                beater.join()
+            live.pop(rid, None)
+        if text is not None and not req.cancelled:  # a cancelled request gets no reply
+            send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+
+    for line in inp:
+        try:
+            msg = json.loads(line)
         except ValueError:
             continue
-        rid, method = req.get("id"), req.get("method")
+        rid, method = msg.get("id"), msg.get("method")
         if rid is None:
-            continue  # notifications
+            if method == "notifications/cancelled" and (req := live.get((msg.get("params") or {}).get("requestId"))):
+                req.cancel()
+            continue
+        if method == "tools/call":
+            live[rid] = Request()
+            threading.Thread(target=call, args=(rid, msg.get("params") or {}, live[rid]), daemon=True).start()
+            continue
         if method == "initialize":
-            result = {"protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
+            result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
                       "capabilities": {"tools": {}}, "serverInfo": {"name": "frugal-accounts", "version": "1"}}
         elif method == "tools/list":
             result = {"tools": [SPEC] if active() else []}
-        elif method == "tools/call":
-            p = req.get("params", {})
-            try:
-                text = delegate(p.get("arguments") or {}) if p.get("name") == "delegate" and active() else "frugal: no secondary account is set up."
-            except Exception as e:  # one bad call must not close the server for the rest of the session
-                with open(DIR / "errors.log", "a", encoding="utf-8") as f:
-                    traceback.print_exc(file=f)
-                text = f"frugal: delegate failed ({type(e).__name__}: {e}). Do it here."
-            result = {"content": [{"type": "text", "text": text}]}
         elif method == "ping":
             result = {}
         else:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}})
             continue
         send({"jsonrpc": "2.0", "id": rid, "result": result})
+    for req in list(live.values()):  # the session ended: no agent keeps working for nobody
+        req.cancel()
 
 
 # Hooks keep per-session state (rule shown, reads this prompt, waived denials) next to the accounts file.
@@ -1176,6 +1263,76 @@ def selftest():
         else:
             os.environ["CLAUDE_CONFIG_DIR"] = saved_cfg
         shutil.rmtree(cfg)
+    # serve: a delegate runs in its own thread with progress, a ping is answered meanwhile, and a cancel kills its agent with no reply
+    sleeper, ended, logged = [sys.executable, "-c", "import time; time.sleep(30)"], [], []
+
+    def stub_cli(argv, prompt, cwd, env, timeout=600):
+        if "slow" in prompt:
+            try:
+                run_tree(sleeper, 60)
+            finally:
+                ended.append(time.time())
+        return 0, "ok", ""
+
+    class Out:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, s):
+            self.lines += [json.loads(x) for x in s.splitlines() if x]
+
+        def flush(self):
+            pass
+
+    def wait(cond, secs=10):
+        end = time.time() + secs
+        while not cond():
+            assert time.time() < end, outp.lines
+            time.sleep(0.05)
+
+    real = {k: g[k] for k in ("run_cli", "load", "save", "active", "log_job", "PROGRESS_EVERY")}
+    g.update(run_cli=stub_cli, load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None,
+             active=lambda: True, log_job=logged.append, PROGRESS_EVERY=0.2)
+    r, w = os.pipe()
+    inp, wr, outp = os.fdopen(r, encoding="utf-8"), os.fdopen(w, "w", encoding="utf-8"), Out()
+    try:
+        req = TL.req = Request()
+        threading.Timer(0.5, req.cancel).start()
+        t = time.time()
+        try:
+            run_tree(sleeper, 60)
+            raise AssertionError("run_tree outlived its cancel")
+        except Cancelled:
+            assert time.time() - t < 15 and not req.procs
+        finally:
+            TL.req = None
+        server = threading.Thread(target=serve, args=(inp, outp), daemon=True)
+        server.start()
+
+        def put(msg):
+            wr.write(json.dumps({"jsonrpc": "2.0", **msg}) + "\n")
+            wr.flush()
+
+        put({"id": 1, "method": "tools/call", "params": {"name": "delegate", "arguments": {"kind": "search", "task": "slow"}, "_meta": {"progressToken": "t1"}}})
+        put({"id": 2, "method": "ping"})
+        wait(lambda: any(m.get("id") == 2 for m in outp.lines))
+        wait(lambda: sum(m.get("method") == "notifications/progress" for m in outp.lines) >= 2)
+        put({"method": "notifications/cancelled", "params": {"requestId": 1}})
+        wait(lambda: ended)
+        put({"id": 3, "method": "tools/call", "params": {"name": "delegate", "arguments": {"kind": "search", "task": "quick"}}})
+        wait(lambda: any(m.get("id") == 3 for m in outp.lines))
+        progress = [m["params"] for m in outp.lines if m.get("method") == "notifications/progress"]
+        assert [p["progress"] for p in progress] == list(range(1, len(progress) + 1)) and {p["progressToken"] for p in progress} == {"t1"}
+        assert progress[-1]["message"].startswith("stub: ") and len(ended) == 1 and not any(m.get("id") == 1 for m in outp.lines)
+        reply = next(m for m in outp.lines if m.get("id") == 3)["result"]["content"][0]["text"]
+        assert reply.startswith("Done by stub") and sorted(e["status"] for e in logged if "end" in e) == ["cancelled", "done"], (reply, logged)
+        wr.close()
+        server.join(10)
+        assert not server.is_alive()
+    finally:
+        if not wr.closed:
+            wr.close()
+        g.update(real)
     return "selftest ok"
 
 
