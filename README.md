@@ -97,6 +97,7 @@ Add and login verify the signed-in email before an account joins the pool. From 
 - Heavy and max work goes to Claude secondaries first, then Codex, then Grok, and never to OpenCode; lighter work goes to the least used account.
 - A hook adds the delegation rule to the first prompt, and to a later one only when the prompt before it ran more than 5 reads or searches here and delegated nothing. Another sends test and build runs and subagents to `delegate` once (asking again runs them here); a sixth read or search in one prompt (shell commands that only read, such as `cat`, `grep` or `git log`, count too) still runs, with a note to hand the rest to `delegate`.
 - Each delegated run gets 10 minutes, 20 at the heavy level and 30 at max.
+- A running `delegate` call reports its progress every 15 seconds, which Claude Code shows in `/tasks`. Stopping it there, or ending the session, kills its agents and stops the retries. Other calls are answered meanwhile.
 - A logged-out account leaves the pool, and each prompt names the command to sign it in again (`/frugal:accounts login <id>`).
 - Delegated Claude runs load frugal (`/frugal`), and Codex runs get its core rules in the brief.
 - A delegated run never delegates again, and with no account set up none of this loads.
@@ -206,6 +207,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.27.9**: `delegate` sends MCP progress while it runs, and a cancelled call kills its agents instead of retrying on other accounts. Each call runs in its own thread, so pings, cancels and parallel calls no longer wait for the one in progress.
 - **0.27.8**: Heavy and max delegate work goes to Claude secondaries first, then Codex, then Grok; free OpenCode models now take only light and standard work. Before, the least used account took it, so a heavy edit could land on a small free model.
 - **0.27.7**: `delegate` takes the brief as `task`, `brief` or `prompt`, and a `run` needs only its `check`: each rejected call re-read the whole context. The heavy-command note no longer asks for "a brief". Edits to the session's own memory, plans, settings and scratchpad no longer count toward the edit budget.
 - **0.27.6**: The fourth edit in a prompt that has not delegated goes to `delegate` once, as kind `edit`, with a brief, a check and a diff review here; calling again goes through. Across 31,524 past prompts, 1,340 made more than three edits and only 51 of them delegated.
