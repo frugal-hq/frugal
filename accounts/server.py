@@ -195,6 +195,21 @@ def list_tools(conf):
         return None
 
 
+def cached_tools(name, tools=None):
+    """Saves a server's listed tools, or with none returns the last saved list. Safe when stale: an unlisted tool is never allowed."""
+    path = DIR / "mcp-tools.json"
+    with LOCK:
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+        if tools is None:
+            return cache.get(name)
+        cache[name] = [{"name": t["name"], "annotations": t.get("annotations") or {}} for t in tools]
+        path.write_text(json.dumps(cache), encoding="utf-8")
+        return tools
+
+
 def mcp_rules(servers):
     """A delegate gets only the tools a server marks readOnlyHint and is denied the rest: it can read a ticket, never answer one.
     Returns (allowed, denied, servers whose tools could not be listed)."""
@@ -204,6 +219,9 @@ def mcp_rules(servers):
             allow.append(mcp_rule(name))  # frugal: a stdio server keeps all its tools; list them over stdio to make it read-only too
             continue
         tools = list_tools(conf)
+        if tools is None:
+            tools = list_tools(conf)  # a server still connecting often answers the second time
+        tools = cached_tools(name) if tools is None else cached_tools(name, tools)
         if tools is None:
             failed.append(name)
             continue
