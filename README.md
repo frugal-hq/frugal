@@ -207,6 +207,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.27.11**: Each delegate job in `~/.frugal/jobs.jsonl` logs its level and the tokens the agent reports, with cache reads, for Frugal Deck's tasks panel. Grok and OpenCode now answer in JSON so their tokens and cost can be read, and Codex's token count comes from its log. Before, only Claude jobs logged a cost and none logged tokens or level.
 - **0.27.10**: A session started from a handoff reads the `Read first:` files in its first batch of tool calls, before replying or asking anything. Before, a new session could reply without having read them.
 - **0.27.9**: `delegate` sends MCP progress while it runs, and a cancelled call kills its agents instead of retrying on other accounts. Each call runs in its own thread, so pings, cancels and parallel calls no longer wait for the one in progress.
 - **0.27.8**: Heavy and max delegate work goes to Claude secondaries first, then Codex, then Grok; free OpenCode models now take only light and standard work. Before, the least used account took it, so a heavy edit could land on a small free model.
