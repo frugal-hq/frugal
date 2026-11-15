@@ -318,10 +318,10 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mc
     if a["kind"] == "grok":
         # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
-        return ["grok", "--no-auto-update", "-m", model, "--effort", effort, "--always-approve", *tools]
+        return ["grok", "--no-auto-update", "-m", model, "--effort", effort, "--always-approve", "--output-format", "json", *tools]
     if a["kind"] == "opencode":
         # --auto approves what is not denied; the plan agent denies edits, so search stays read-only (tested on opencode 1.19.5)
-        return ["opencode", "run", "-m", model, "--variant", effort, "--agent", "plan" if kind == "search" else "build", "--auto"]
+        return ["opencode", "run", "-m", model, "--variant", effort, "--agent", "plan" if kind == "search" else "build", "--auto", "--format", "json"]
     sandbox = ["-s", "workspace-write"] if kind in ("edit", "run") else []
     off = [x for n in mcp_off for x in ("-c", f"mcp_servers.{n}.enabled=false")]  # only servers its config has: an unknown one breaks codex
     return ["codex", "exec", "--skip-git-repo-check", *(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}", *off, *sandbox, "-"]
@@ -458,6 +458,38 @@ def run_brief(text, check, level, effort, cwd, job):
     return f"frugal: check `{check}` exited {code}, failed:\n{out[-800:]}\n\nAgent notes, not a test result:\n{notes}"
 
 
+def cli_reply(agent, out, err, job):
+    """The agent's answer from its CLI output; the tokens and cost it reports add up in job across tries."""
+    def add(tokens, cost=0):
+        job["tokens"] = job.get("tokens", 0) + (tokens or 0)
+        if cost or "cost" in job or agent == "claude":
+            job["cost"] = job.get("cost", 0) + (cost or 0)
+    try:
+        if agent == "claude":  # --output-format json; cache reads count, as in grok's and opencode's totals
+            j = json.loads(out)
+            u = j.get("usage") or {}
+            add(sum(u.get(k) or 0 for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")), j.get("total_cost_usd"))
+            return ("", err or j.get("result", "")) if j.get("is_error") else (j.get("result") or "", err)
+        if agent == "grok":  # --output-format json
+            j = json.loads(out)
+            add((j.get("usage") or {}).get("total_tokens"), j.get("total_cost_usd"))
+            return j.get("text") or "", err or ("" if j.get("text") else out)
+        if agent == "opencode":  # --format json: one event per line
+            events = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+            if not events:
+                return out, err
+            parts = [e.get("part") or {} for e in events]
+            add(sum((p.get("tokens") or {}).get("total") or 0 for p in parts if p.get("type") == "step-finish"),
+                sum(p.get("cost") or 0 for p in parts if p.get("type") == "step-finish"))
+            text = "\n".join(p["text"] for p in parts if p.get("type") == "text" and p.get("text")).strip()
+            return text, err or ("" if text else out)
+    except (ValueError, AttributeError, TypeError):
+        return out, err
+    if m := re.search(r"^tokens used\s*\n([\d,]+)", err, re.M):  # codex exec ends its stderr log with the count
+        add(int(m.group(1).replace(",", "")))
+    return out, err
+
+
 BUSY = {}
 
 
@@ -495,7 +527,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             BUSY[a["id"]] = BUSY.get(a["id"], 0) + 1
         tried.append(a["id"])
         model, eff = choose(a, kind, level, effort)
-        job.update(account=a["id"], model=model)
+        job.update(account=a["id"], model=model, level=level if level in LEVELS else DEFAULT_LEVEL.get(kind, "light"))
         prompt = (f"{text}\n\nA previous attempt failed: {failure}" if failure else text) + \
             ("" if raw else "\n\nReply in under 150 words: what you found or changed, with file paths.")
         if raw:
@@ -526,13 +558,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 BUSY[a["id"]] -= 1
             if mcp_file:
                 os.unlink(mcp_file)
-        if a["kind"] == "claude":  # --output-format json: the reply and what the run cost
-            try:
-                j = json.loads(out)
-                job["cost"] = job.get("cost", 0) + (j.get("total_cost_usd") or 0)
-                out, err = ("", err or j.get("result", "")) if j.get("is_error") else (j.get("result") or "", err)
-            except (ValueError, AttributeError):
-                pass
+        out, err = cli_reply(a["kind"], out, err, job)
         with LOCK, file_lock():
             data = load()
             for x in data["accounts"]:
@@ -1105,7 +1131,7 @@ def selftest():
     assert AUTH.search("Error: Not signed in. To authenticate")
     oc = {"id": "o", "kind": "opencode", "model": "opencode/glm-5.3-flash-free", "data_dir": "/d"}
     assert choose(oc, "search", "max") == ("opencode/glm-5.3-flash-free", "high") and account_env(oc) == {"XDG_DATA_HOME": "/d"}
-    assert argv_for(oc, "search", *choose(oc, "search"))[-4:] == ["medium", "--agent", "plan", "--auto"] and "build" in argv_for(oc, "edit", "m", "low")
+    assert argv_for(oc, "search", *choose(oc, "search"))[-6:] == ["medium", "--agent", "plan", "--auto", "--format", "json"] and "build" in argv_for(oc, "edit", "m", "low")
     pickle = {"kind": "opencode", "model": "opencode/big-pickle"}
     assert blocked(pickle, {}) and not blocked(pickle, {"opencode_allow_training": True}) and not blocked(oc, {})
     assert not blocked({"kind": "opencode", "model": "openrouter/nvidia/nemotron-x"}, {})
@@ -1226,6 +1252,16 @@ def selftest():
         r = brief("look", "search", None, None, None, ".", job=job)
         assert r.endswith("found it") and job["cost"] == 0.25 and job["account"] == "stub" and outcome(r, job) == "done", (r, job)
         assert outcome("frugal: no secondary account finished this. Do it here.", {}) == "not delegated"
+        assert job["level"] == "standard" and job["tokens"] == 0, job
+        # each CLI's usage: tokens and cost add up across tries, the reply is the bare answer
+        job = {}
+        assert cli_reply("grok", json.dumps({"text": "ok", "usage": {"total_tokens": 100}, "total_cost_usd": 0.5}), "", job) == ("ok", "")
+        oc = "\n".join(json.dumps(e) for e in [{"type": "text", "part": {"type": "text", "text": "ok"}},
+                                               {"type": "step_finish", "part": {"type": "step-finish", "tokens": {"total": 20}, "cost": 0}}])
+        log = "codex\nok\ntokens used\n11,590\nERROR x"
+        assert cli_reply("opencode", oc, "", job) == ("ok", "") and cli_reply("codex", "ok", log, job) == ("ok", log)
+        assert job == {"tokens": 11710, "cost": 0.5}, job
+        assert cli_reply("opencode", "Error: boom", "", {}) == ("Error: boom", "") and cli_reply("grok", "{}", "", {}) == ("", "{}")
         # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
         os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
         assert set(session_mcp(str(cfg))) == {"sm", "p"}
