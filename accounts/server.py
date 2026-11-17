@@ -501,6 +501,8 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     job = {} if job is None else job  # filled with the account, model and cost of the last try
     if check and kind == "run":
         return run_brief(text, check, level, effort, cwd, job)
+    if (barred := [n for n in mcp if n in load().get("no_delegate_mcp", [])]):  # set per server in Frugal Deck's MCP servers
+        return f"frugal: {', '.join(barred)} is off for delegates in Frugal Deck. Do it here."
     found = session_mcp(cwd) if mcp else {}
     if (missing := [n for n in mcp if n not in found]):
         return f"frugal: this session has no MCP server named {', '.join(missing)}. Do it here."
