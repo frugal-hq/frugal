@@ -896,11 +896,14 @@ def gate(event):
                       "conversation has, call again and it goes through.")
     elif tool == TOOL:
         s["delegated"] = s.get("delegated", 0) + 1
-    elif tool == "Agent" and (key := hashlib.sha1(inp.get("prompt", "").encode()).hexdigest()[:12]) not in s.get("agents", []):
+    elif tool == "Agent" and (tries := s.get("agents", []).count(key := hashlib.sha1(inp.get("prompt", "").encode()).hexdigest()[:12])) < 2:
         # Per brief, like "waived": a session-wide flag let the rest of a parallel batch through after the first was sent back.
-        s["agents"] = [*s.get("agents", []), key][-20:]
-        reason = (f"frugal: a subagent here runs on the main account. Give this to {TOOL} instead (one brief per piece in \"tasks\"). "
-                  "If it needs this session's own tools, call again and it goes through.")
+        # Sent back twice: one retry used to pass, and nearly every retry was work a delegate could do.
+        s["agents"] = [*s.get("agents", []), key][-40:]
+        reason = (f"frugal: a subagent here runs on the main account. Give this to {TOOL} instead (one brief per piece in \"tasks\"); "
+                  "delegates read files, run bash and fetch the web, and take this session's MCP servers named in \"mcp\" (read-only tools).") if not tries else (
+                  f"frugal: still send it to {TOOL}: file reads, bash, web and this session's read-only MCP tools all work there. "
+                  "Call Agent a third time only if it needs what a delegate lacks (an MCP tool that writes, or this conversation's context); then it goes through.")
     DIR.mkdir(exist_ok=True)
     state(sid).write_text(json.dumps(s), encoding="utf-8")
     return reason, note
@@ -1214,6 +1217,9 @@ def selftest():
         assert gate({**ev, "tool_input": {"file_path": "C:\\Users\\u\\.claude-x\\projects\\p\\memory\\m.md"}}) == (None, None)
         assert gate({**ev, "tool_input": {"file_path": "C:\\Users\\u\\AppData\\Local\\Temp\\claude\\a\\b\\scratchpad\\t.js"}}) == (None, None)
         assert 'in "task"' in gate(ev)[0]
+        # Agent: the same brief is sent back twice, the third goes through
+        ag = {"session_id": sid, "tool_name": "Agent", "tool_input": {"prompt": "p"}}
+        assert '"mcp"' in gate(ag)[0] and "third time" in gate(ag)[0] and gate(ag) == (None, None)
         assert delegate({"kind": "edit"}).startswith('frugal: put the brief in "task"')
     finally:
         globals()["active"] = was_active
