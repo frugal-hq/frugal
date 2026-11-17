@@ -506,6 +506,21 @@ def cli_reply(agent, out, err, job):
 BUSY = {}
 
 
+def touched(cwd):
+    """Modified and untracked files of cwd's git tree, with their mtimes; {} outside one."""
+    try:
+        out = subprocess.run(["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"], cwd=cwd, capture_output=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    files = {}
+    for f in filter(None, out.decode("utf-8", "replace").split("\0")):
+        try:
+            files[f] = os.path.getmtime(os.path.join(cwd, f))
+        except OSError:
+            pass  # deleted: frugal: list deletions too with `git ls-files -d`
+    return files
+
+
 def relogin(ids):
     return "".join(f"frugal: secondary account {i} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
 
@@ -527,6 +542,8 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     allow, deny, failed = mcp_rules(servers)
     if failed:
         return f"frugal: could not list the tools of {', '.join(failed)} to keep the delegate read-only. Do it here."
+    if level not in LEVELS and kind == "edit" and len(text) > 2500:
+        level = "heavy"  # a long edit brief is multi-file work: on the standard level it ran past 10 minutes and started over
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
     failure, tried, relog = "", [], []
     if check:
@@ -570,7 +587,12 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         try:
             if servers and a.get("config_dir"):
                 clear_needs_auth(a["config_dir"], [n for n, c in servers.items() if c.get("url")])
+            before = touched(cwd) if kind == "edit" else {}
             code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, allow, deny), prompt, cwd, env, TIMEOUT.get(level, 600))
+            # A timed-out edit leaves its work in the tree: the next account would start over on top of it, so hand it back as is.
+            if code == 124 and kind == "edit" and (left := sorted(f for f, t in touched(cwd).items() if before.get(f) != t)):
+                return (f"{relogin(relog)}frugal: {a['id']} timed out after changing {', '.join(left[:30])}, untested. "
+                        "Review that diff here, then finish it here or delegate the rest, saying what is already done.")
         finally:
             with LOCK:
                 BUSY[a["id"]] -= 1
@@ -1277,6 +1299,14 @@ def selftest():
         assert r.endswith("found it") and job["cost"] == 0.25 and job["account"] == "stub" and outcome(r, job) == "done", (r, job)
         assert outcome("frugal: no secondary account finished this. Do it here.", {}) == "not delegated"
         assert job["level"] == "standard" and job["tokens"] == 0, job
+        # a long edit brief runs on heavy; a timed-out edit returns the files it changed, not the ones already dirty
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            Path(repo, "old.txt").write_text("dirty", encoding="utf-8")
+            g["run_cli"] = lambda argv, prompt, cwd, env, timeout=600: (Path(cwd, "new.txt").write_text("x", encoding="utf-8"), (124, "", "timed out"))[1]
+            job = {}
+            r = brief("x" * 3000, "edit", None, None, None, repo, job=job)
+            assert "timed out after changing new.txt," in r and "old.txt" not in r and job["level"] == "heavy", (r, job)
         # each CLI's usage: tokens and cost add up across tries, the reply is the bare answer
         job = {}
         assert cli_reply("grok", json.dumps({"text": "ok", "usage": {"total_tokens": 100}, "total_cost_usd": 0.5}), "", job) == ("ok", "")
