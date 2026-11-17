@@ -133,16 +133,29 @@ def own(a):
 
 def session_mcp(cwd):
     """This session's MCP servers, user scope plus the project's. Only a Claude delegate gets them, and only the ones a task names:
-    which agents may reach a server's data is each project's rule, and frugal never hands these to Codex, Grok or OpenCode."""
+    which agents may reach a server's data is each project's rule, and frugal never hands these to Codex, Grok or OpenCode.
+    In a Frugal Deck chat, FRUGAL_DECK_MCP holds the chat's resolved set: the account's servers its allow and deny lists pass, plus the Deck's."""
     folder = os.environ.get("CLAUDE_CONFIG_DIR")
     try:
         data = json.loads((Path(folder) / ".claude.json" if folder else HOME / ".claude.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        data = {}
     servers = dict(data.get("mcpServers") or {})
     for project, conf in (data.get("projects") or {}).items():
         if same(project) == same(cwd):
             servers.update(conf.get("mcpServers") or {})
+    try:
+        deck = json.loads(os.environ.get("FRUGAL_DECK_MCP") or "null")
+    except ValueError:
+        deck = None
+    if not isinstance(deck, dict):
+        return servers
+    def entries(name, conf):  # the forms Claude Code's allowedMcpServers and deniedMcpServers match a server by
+        target = {"serverUrl": conf["url"]} if conf.get("url") else {"serverCommand": [conf.get("command"), *(conf.get("args") or [])]}
+        return {"serverName": name}, target
+    allowed, denied = deck.get("allowed") or [], deck.get("denied") or []
+    servers = {n: c for n, c in servers.items() if any(e in allowed for e in entries(n, c)) and not any(e in denied for e in entries(n, c))}
+    servers.update(deck.get("mcpServers") or {})
     return servers
 
 
@@ -504,6 +517,8 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     if (barred := [n for n in mcp if n in load().get("no_delegate_mcp", [])]):  # set per server in Frugal Deck's MCP servers
         return f"frugal: {', '.join(barred)} is off for delegates in Frugal Deck. Do it here."
     found = session_mcp(cwd) if mcp else {}
+    names = {mcp_rule(k)[5:]: k for k in found}  # a brief may name "claude_ai_Pylon", as the tool names spell it
+    mcp = [n if n in found else names.get(n, n) for n in mcp]
     if (missing := [n for n in mcp if n not in found]):
         return f"frugal: this session has no MCP server named {', '.join(missing)}. Do it here."
     servers, expired = with_auth({n: found[n] for n in mcp})
@@ -539,6 +554,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         else:
             prompt = f"{CODEX_RULES}\n\n{prompt}"  # Codex cannot load the skill, so it gets the essentials
         env = child_env(a, {DELEGATED: "1"})
+        env.pop("FRUGAL_DECK_MCP", None)  # the chat's server configs, which may carry keys; a delegate gets only its servers, in mcp_file
         only = data.get("claude_only_mcp", [])  # MCP servers no other agent may reach
         if a["kind"] != "claude":
             # frugal: a token is found by the server's name in the variable (SERVICEMINDER_MCP_TOKEN); read bearer_token_env_var if one is named otherwise.
@@ -1267,6 +1283,11 @@ def selftest():
         # Claude-only MCP: other agents lose the server's token and grok its Claude MCP servers; a note never goes to grok
         os.environ["FRUGALTEST_SERVICEMINDER_TOKEN"] = "x"
         assert set(session_mcp(str(cfg))) == {"sm", "p"}
+        # in a Deck chat: the account's servers its lists pass, plus the Deck's
+        os.environ["FRUGAL_DECK_MCP"] = json.dumps({"mcpServers": {"d": {"type": "http", "url": "https://d/"}},
+                                                    "allowed": [{"serverName": "sm"}, {"serverCommand": ["b"]}], "denied": [{"serverName": "p"}]})
+        assert set(session_mcp(str(cfg))) == {"sm", "d"}
+        del os.environ["FRUGAL_DECK_MCP"]
         (cfg / ".credentials.json").write_text(json.dumps({"mcpOAuth": {
             "py|1": {"serverName": "py", "serverUrl": "https://p/", "accessToken": "tok", "refreshToken": "REFRESH", "expiresAt": 2000_000},
             "old|1": {"serverName": "old", "serverUrl": "https://o/", "accessToken": "t2", "expiresAt": 1000_000}}}), encoding="utf-8")
@@ -1280,12 +1301,15 @@ def selftest():
         (cfg / "mcp-needs-auth-cache.json").write_text(json.dumps({"py": {}, "x": {}}), encoding="utf-8")
         clear_needs_auth(cfg, ["py"])
         assert json.loads((cfg / "mcp-needs-auth-cache.json").read_text(encoding="utf-8")) == {"x": {}}
+        os.environ["FRUGAL_DECK_MCP"] = "{}"
         g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (envs.append((argv[0], env, argv)), (0, "ok", ""))[1],
                  load=lambda: {"claude_only_mcp": ["serviceminder"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
         assert brief("look", "search", None, None, None, ".").startswith("Done by") and brief("note", "note", None, None, None, ".") == "ok"
         (k1, e1, a1), (k2, e2, _) = envs[-2:]
         assert k1 in ("grok", "opencode") and "FRUGALTEST_SERVICEMINDER_TOKEN" not in e1 and e1.get("GROK_CLAUDE_MCPS_ENABLED", "false") == "false"
         assert k2 == "claude" and "FRUGALTEST_SERVICEMINDER_TOKEN" in e2 and "--mcp-config" not in a1
+        assert "FRUGAL_DECK_MCP" not in e1 and "FRUGAL_DECK_MCP" not in e2
+        del os.environ["FRUGAL_DECK_MCP"]
         # A task naming an MCP server skips the others and reaches Claude with only that server; an unknown name runs nowhere.
         assert brief("look up a customer", "search", None, None, None, str(cfg), ["sm"]).startswith("Done by") and envs[-1][0] == "claude"
         argv = envs[-1][2]
