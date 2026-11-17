@@ -107,6 +107,8 @@ Add and login verify the signed-in email before an account joins the pool. From 
 
 **Humanizer is opt-in.** The first time frugal is about to write text for people, it asks once: Yes, No, Always this session, or Never this session. It never runs for code, commits, or internal notes.
 
+**Commits are opt-in.** When you ask to commit, write commit messages, or commit and push, the `commits` skill follows the repo's own commit convention first (CLAUDE.md, AGENTS.md, CONTRIBUTING, commitlint config, or the recent `git log`). Otherwise it asks once: use frugal's commit style (Conventional Commits, one short line, no body or trailers) or write commits the usual way. It never bundles changes: one change per commit, version bumps before docs before the rest, and it shows the plan and asks before committing and again before pushing. In Frugal Deck (only when `FRUGAL_DECK` is set) the question has an extra "Always in <name>" option that saves the choice per workspace, group or folder in `~/.frugal-deck/commit-style.txt`, so later commits skip the question.
+
 frugal covers what caveman and ponytail do, so you do not need them. If they are enabled, disable them: their rules are added to every call (see [Benchmarks](#benchmarks)).
 
 ## Should you use it?
@@ -207,6 +209,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.28.0**: New `commits` skill: when you ask to commit or commit and push, it follows the repo's convention first, otherwise asks once to opt into frugal's commit style (Conventional Commits, one short line, no trailers), one change per commit, version bump before docs before the rest, and a plan shown before each commit and push. In Frugal Deck the opt-in can be saved per workspace, group or folder. In a Frugal Deck chat, `delegate` hands a task the MCP servers that chat has (the account's own its allow and deny lists pass, plus the Deck's, read from `FRUGAL_DECK_MCP`), never passes that variable on to any agent, accepts a server named as its tools spell it (`claude_ai_Pylon`), and refuses servers the Deck turned off for delegates. A subagent brief is sent back twice before it runs, since nearly every first retry was work a delegate could do. An edit brief over 2,500 characters with no level runs on heavy, and an edit that times out returns the files it changed instead of starting over on another account. Claude delegates run this session's frugal through `--plugin-dir`, so a secondary account never runs an older install.
 - **0.27.11**: Each delegate job in `~/.frugal/jobs.jsonl` logs its level and the tokens the agent reports, with cache reads, for Frugal Deck's tasks panel. Grok and OpenCode now answer in JSON so their tokens and cost can be read, and Codex's token count comes from its log. Before, only Claude jobs logged a cost and none logged tokens or level.
 - **0.27.10**: A session started from a handoff reads the `Read first:` files in its first batch of tool calls, before replying or asking anything. Before, a new session could reply without having read them.
 - **0.27.9**: `delegate` sends MCP progress while it runs, and a cancelled call kills its agents instead of retrying on other accounts. Each call runs in its own thread, so pings, cancels and parallel calls no longer wait for the one in progress.
