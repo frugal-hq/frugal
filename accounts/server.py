@@ -327,7 +327,9 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mc
         tools = ["--allowedTools", allowed] if kind in ("search", "run") else ["--permission-mode", "acceptEdits", "--allowedTools", allowed]
         tools += ["--disallowedTools", " ".join(mcp_deny)] if mcp_deny else []
         # Strict: without it every delegated run starts all of the user's MCP servers (WSL, Python, Node) and leaves them running.
-        return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, *tools, "--strict-mcp-config", *(["--mcp-config", mcp_file] if mcp_file else [])]
+        # --plugin-dir replaces the account's own frugal: a delegate runs the same version as this session, never an older install.
+        return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, *tools, "--strict-mcp-config", *(["--mcp-config", mcp_file] if mcp_file else []),
+                "--plugin-dir", str(Path(__file__).resolve().parent.parent)]
     if a["kind"] == "grok":
         # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
@@ -1212,7 +1214,7 @@ def selftest():
     os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
     a = argv_for(claude, "search", "sonnet", "low", (), "m.json", [mcp_rule("sm"), mcp_rule("my server")], [mcp_rule("py", "send reply")])
     assert a[a.index("--disallowedTools") + 1] == "mcp__py__send_reply" and "--disallowedTools" not in argv_for(claude, "search", "sonnet", "low")
-    assert a[-3:] == ["--strict-mcp-config", "--mcp-config", "m.json"] and "--strict-mcp-config" in argv_for(claude, "edit", "sonnet", "low") and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
+    assert a[-5:-2] == ["--strict-mcp-config", "--mcp-config", "m.json"] and a[-2] == "--plugin-dir" and Path(a[-1], ".claude-plugin").is_dir() and "--strict-mcp-config" in argv_for(claude, "edit", "sonnet", "low") and a[a.index("--allowedTools") + 1] == "Bash Read Grep Glob mcp__sm mcp__my_server"
     d = tempfile.mkdtemp()
     assert work_dir({"cwd": "x", "check": f"cd {d} && t"}) == "x" and work_dir({"check": f'cd "{d}" && t'}) == d and work_dir({"check": f"cd {d}; t"}) != d
     assert work_dir({"check": "cd /nonexistent-dir-xyz && t"}) == (os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
