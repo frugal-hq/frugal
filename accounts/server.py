@@ -363,7 +363,7 @@ TL = threading.local()  # .req: the Request this thread works for; unset in hook
 
 def kill_tree(p):
     if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdin=subprocess.DEVNULL, capture_output=True)
     else:
         try:
             os.killpg(p.pid, signal.SIGKILL)
@@ -375,6 +375,7 @@ def run_tree(cmd, timeout, input=None, **kw):
     # On timeout kill the whole tree: subprocess.run kills only the .cmd shim or shell, and the
     # grandchild keeps the pipes open, so communicate() never returns. None means timed out.
     # Never inherit stdin: in the MCP server it carries the protocol, and a command that reads it would eat requests.
+    # On Windows, starting a child that inherits it also blocks until the next message arrives (the hung edit delegates).
     req = getattr(TL, "req", None)
     if req and req.cancelled:
         raise Cancelled
@@ -517,7 +518,7 @@ BUSY = {}
 def touched(cwd):
     """Modified and untracked files of cwd's git tree, with their mtimes; {} outside one."""
     try:
-        out = subprocess.run(["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"], cwd=cwd, capture_output=True, timeout=30).stdout
+        out = subprocess.run(["git", "ls-files", "-m", "-o", "--exclude-standard", "-z"], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
         return {}
     files = {}
