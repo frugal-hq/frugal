@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.28.4-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.28.5-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
@@ -209,6 +209,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.28.5**: An `edit` delegate no longer hangs before its agent starts. On Windows, a command the server started inherited its stdin, the pipe Claude Code sends requests on, and stayed blocked until the next request arrived.
 - **0.28.4**: A delegated job logs its process id in `jobs.jsonl` while it runs, and the end of its stderr when it times out or is cancelled, so a hung agent can be found and diagnosed.
 - **0.28.3**: The handoff notice past each 150k tokens of context is sent again on the next message when Claude Code dropped it, instead of waiting for the next 150k.
 - **0.28.2**: A `run` delegate whose check fails is logged as failed, even when the agent explaining the failure says it is done, and that agent is told not to change any file. The tool description says a `run` executes only `check`, never the task. A Bash command started in the background is no longer sent to `delegate`, which would block on it and end it at its timeout.
