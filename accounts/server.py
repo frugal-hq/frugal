@@ -386,13 +386,17 @@ def run_tree(cmd, timeout, input=None, **kw):
             dead = req.cancelled
         if dead:
             kill_tree(p)
+    if (job := getattr(TL, "job", None)) is not None:
+        job["pid"] = p.pid
+        log_job({**job, "status": "running"})  # a hung agent can be found by its pid while it runs
+    err, result = "", None
     try:
         out, err = p.communicate(input, timeout=timeout)
         result = p.returncode, out, err
     except subprocess.TimeoutExpired:
         kill_tree(p)
         try:
-            p.communicate(timeout=10)
+            err = p.communicate(timeout=10)[1]
         except subprocess.TimeoutExpired:
             pass  # a process that escaped the tree still holds the pipes; give up on it
         result = None
@@ -400,6 +404,8 @@ def run_tree(cmd, timeout, input=None, **kw):
         if req:
             with req.lock:
                 req.procs.discard(p)
+        if job is not None and (result is None or (req and req.cancelled)):
+            job["stderr"] = (err or "")[-500:]  # why a timed-out or cancelled agent never answered
     if req and req.cancelled:
         raise Cancelled  # stops the retries too: every try and check runs through here
     return result
@@ -676,11 +682,12 @@ def run_job(b, args, cwd):
     log_job({**job, "status": "running"})
     if (req := getattr(TL, "req", None)):
         req.jobs.append(job)
-    text = None
+    text, TL.job = None, job
     try:
         text = brief(b, kind, args.get("check"), args.get("level"), args.get("effort"), cwd, args.get("mcp") or (), job)
         return text
     finally:
+        TL.job = None
         status = "cancelled" if req and req.cancelled else outcome(text, job) if text else "failed"
         log_job({**job, "status": status, "end": time.time(), "result": (text or "")[:300]})
 
