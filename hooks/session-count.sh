@@ -35,11 +35,10 @@ round=; case $n in 10|25|40|55|70|85|100) round=1 ;; esac
 # Context of the last reply: input plus cached tokens from its usage record.
 ctx=$(grep -o '"usage":{"input_tokens":[0-9]*,"cache_creation_input_tokens":[0-9]*,"cache_read_input_tokens":[0-9]*' "$transcript" 2>/dev/null | tail -1 | grep -o '[0-9][0-9]*' | awk '{s+=$1} END {print s+0}')
 level=$(( ${ctx:-0} / 150000 ))
-fired=$(cat "$dir/handoff-$sid" 2>/dev/null || echo 0)
-# A compaction shrinks the context; re-arm from the new level.
-[ "$level" -lt "$fired" ] && echo "$level" > "$dir/handoff-$sid"
-if [ "$level" -gt "$fired" ] && active; then
-  echo "$level" > "$dir/handoff-$sid"
+# Last level whose notice reached the model, read from the transcript: a marker file is spent even when
+# Claude Code drops that run's output. A compaction boundary re-arms it.
+fired=$(grep -oE '"subtype":"compact_boundary"|"hookEvent":"UserPromptSubmit","content":"([^"\\]|\\.)*frugal: the context is about [0-9]+k' "$transcript" 2>/dev/null | awk '/compact_boundary/ {k = 0; next} {sub(/k$/, ""); sub(/.* /, ""); k = $0} END {print int(k * 1000 / 150000)}')
+if [ "$level" -gt "${fired:-0}" ] && active; then
   echo "frugal: the context is about $(( ctx / 1000 ))k tokens, re-sent on every message. If work remains, end this reply or the next at a natural breakpoint with the handoff block below."
   # Round messages print all of session.md below.
   [ -n "$round" ] || sed -n '/^\*\*Handoff\.\*\*/,$p' "$skill/modules/session.md"
