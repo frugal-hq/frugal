@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.28.2-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.28.3-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
@@ -209,6 +209,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.28.3**: The handoff notice past each 150k tokens of context is sent again on the next message when Claude Code dropped it, instead of waiting for the next 150k.
 - **0.28.2**: A `run` delegate whose check fails is logged as failed, even when the agent explaining the failure says it is done, and that agent is told not to change any file. The tool description says a `run` executes only `check`, never the task. A Bash command started in the background is no longer sent to `delegate`, which would block on it and end it at its timeout.
 - **0.28.1**: `delegate` logs the account and model as soon as one takes a task, and again when another takes over after a failed try, so Frugal Deck shows who runs each task while it runs. The selftest passes inside a Frugal Deck chat.
 - **0.28.0**: New `commits` skill: when you ask to commit or commit and push, it follows the repo's convention first, otherwise asks once to opt into frugal's commit style (Conventional Commits, one short line, no trailers), one change per commit, version bump before docs before the rest, and a plan shown before each commit and push. In Frugal Deck the opt-in can be saved per workspace, group or folder. In a Frugal Deck chat, `delegate` hands a task the MCP servers that chat has (the account's own its allow and deny lists pass, plus the Deck's, read from `FRUGAL_DECK_MCP`), never passes that variable on to any agent, accepts a server named as its tools spell it (`claude_ai_Pylon`), and refuses servers the Deck turned off for delegates. A subagent brief is sent back twice before it runs, since nearly every first retry was work a delegate could do. An edit brief over 2,500 characters with no level runs on heavy, and an edit that times out returns the files it changed instead of starting over on another account. Claude delegates run this session's frugal through `--plugin-dir`, so a secondary account never runs an older install.
