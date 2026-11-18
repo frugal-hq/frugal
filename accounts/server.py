@@ -1212,6 +1212,7 @@ def selftest():
     (cfg / ".claude.json").write_text(json.dumps({"mcpServers": {"sm": {"command": "a"}}, "projects": {
         str(cfg).replace("\\", "/"): {"mcpServers": {"p": {"command": "b"}}}, "elsewhere": {"mcpServers": {"q": {"command": "c"}}}}}), encoding="utf-8")
     saved_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    saved_deck = os.environ.pop("FRUGAL_DECK_MCP", None)
     os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
     a = argv_for(claude, "search", "sonnet", "low", (), "m.json", [mcp_rule("sm"), mcp_rule("my server")], [mcp_rule("py", "send reply")])
     assert a[a.index("--disallowedTools") + 1] == "mcp__py__send_reply" and "--disallowedTools" not in argv_for(claude, "search", "sonnet", "low")
@@ -1363,6 +1364,10 @@ def selftest():
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
         else:
             os.environ["CLAUDE_CONFIG_DIR"] = saved_cfg
+        if saved_deck is None:
+            os.environ.pop("FRUGAL_DECK_MCP", None)
+        else:
+            os.environ["FRUGAL_DECK_MCP"] = saved_deck
         shutil.rmtree(cfg)
     # serve: a delegate runs in its own thread with progress, a ping is answered meanwhile, and a cancel kills its agent with no reply
     sleeper, ended, logged = [sys.executable, "-c", "import time; time.sleep(30)"], [], []
