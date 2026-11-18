@@ -468,7 +468,7 @@ def run_brief(text, check, level, effort, cwd, job):
     if code == 0:
         return f"frugal: check `{check}` exited 0, passed:\n{out[-300:]}"
     notes = brief(f"{text}\n\nThe command `{check}` already ran and exited {code}. The end of its output:\n{out[-8000:]}\n\n"
-                  "Find the cause of each failure from this output and the code. Do not run the command again.",
+                  "Find the cause of each failure from this output and the code. Do not run the command again, and do not change any file.",
                   "search", None, level, effort, cwd, job=job)
     return f"frugal: check `{check}` exited {code}, failed:\n{out[-800:]}\n\nAgent notes, not a test result:\n{notes}"
 
@@ -662,6 +662,8 @@ def log_job(entry):
 
 
 def outcome(text, job):
+    if re.match(r"frugal: check `.*` exited \d+, failed", text):
+        return "failed"
     if re.search(r"^(Done by |frugal: check `.*` exited 0, passed)", text, re.M):
         return "done"
     return "failed" if job.get("account") else "not delegated"
