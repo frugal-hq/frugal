@@ -904,7 +904,8 @@ def gate(event):
                     "(kind \"search\", pieces in \"tasks\") and work from its summary.")
     if tool in ("Bash", "PowerShell"):
         cmd = inp.get("command", "")
-        if heavy(cmd) and cmd not in s.get("waived", []):
+        # A background launch costs nothing while it runs; delegate would block on it and end it at its timeout.
+        if heavy(cmd) and not inp.get("run_in_background") and cmd not in s.get("waived", []):
             s["waived"] = [*s.get("waived", []), cmd][-20:]
             reason = (f"frugal: send this to {TOOL} with kind \"run\" and the exact command as \"check\" (with `set -o pipefail;` first if it pipes the run into tail or head); no \"task\" needed; "
                       "it runs the command once in bash and returns its real exit code and output. If it says \"Do it here\", "
@@ -1239,6 +1240,8 @@ def selftest():
         state(sid).write_text(json.dumps({"edits": 0}), encoding="utf-8")
         ev = {"session_id": sid, "tool_name": "Edit", "tool_input": {"file_path": "a"}}
         assert all(gate(ev)[0] is None for _ in range(EDIT_BUDGET)) and 'kind "edit"' in gate(ev)[0] and gate(ev) == (None, None)
+        assert gate({**ev, "tool_name": "Bash", "tool_input": {"command": "npm test", "run_in_background": True}}) == (None, None)
+        assert outcome("frugal: check `x` exited 1, failed:\nboom\n\nAgent notes, not a test result:\nDone by g", {"account": "g"}) == "failed"
         state(sid).write_text(json.dumps({"edits": EDIT_BUDGET, "delegated": 1}), encoding="utf-8")
         assert gate({**ev, "tool_name": "Write"}) == (None, None) and gate({**ev, "agent_id": "x"}) == (None, None)
         state(sid).write_text(json.dumps({"edits": EDIT_BUDGET}), encoding="utf-8")
