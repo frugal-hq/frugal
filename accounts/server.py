@@ -564,6 +564,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         tried.append(a["id"])
         model, eff = choose(a, kind, level, effort)
         job.update(account=a["id"], model=model, level=level if level in LEVELS else DEFAULT_LEVEL.get(kind, "light"))
+        log_job({**job, "status": "running"})  # Frugal Deck shows who runs it, and who took over after a failed try
         prompt = (f"{text}\n\nA previous attempt failed: {failure}" if failure else text) + \
             ("" if raw else "\n\nReply in under 150 words: what you found or changed, with file paths.")
         if raw:
