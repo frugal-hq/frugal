@@ -642,10 +642,10 @@ SPEC = {
                    "test or build runs, edits you can brief exactly. Independent pieces go in \"tasks\" and run in parallel. "
                    "Keep design and the final check here; \"do it here\" means do it yourself.",
     "inputSchema": {"type": "object", "required": ["kind"], "properties": {
-        "task": {"type": "string", "description": "Goal, exact paths, done-when. Optional with kind run."},
+        "task": {"type": "string", "description": "Goal, exact paths, done-when. With kind run it is never executed: it only guides the explanation of a failure."},
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
-        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
+        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once; put every command to run here, chained with &&. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
         "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the folder the check starts with `cd` into, else the session's project dir. Set it when the work is outside the project."},
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
