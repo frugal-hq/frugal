@@ -534,6 +534,11 @@ def relogin(ids):
     return "".join(f"frugal: secondary account {i} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
 
 
+def failed_try(job, a, model, code, began, reason):
+    # Every try's reason, for Frugal Deck's Failed tasks; the reply names only the last one.
+    job.setdefault("failures", []).append({"account": a["id"], "model": model, "exit": code, "seconds": round(time.time() - began), "reason": reason[-300:]})
+
+
 def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     job = {} if job is None else job  # filled with the account, model and cost of the last try
     if check and kind == "run":
@@ -572,6 +577,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         model, eff = choose(a, kind, level, effort)
         job.update(account=a["id"], model=model, level=level if level in LEVELS else DEFAULT_LEVEL.get(kind, "light"))
         log_job({**job, "status": "running"})  # Frugal Deck shows who runs it, and who took over after a failed try
+        began = time.time()
         prompt = (f"{text}\n\nA previous attempt failed: {failure}" if failure else text) + \
             ("" if raw else "\n\nReply in under 150 words: what you found or changed, with file paths.")
         if raw:
@@ -626,6 +632,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         label = f"{a['id']} ({', '.join(filter(None, [model, f'{eff} effort']))})"
         if code != 0 or not out:
             failure = (err or out or f"exit {code}")[-400:]
+            failed_try(job, a, model, code, began, failure)
             continue
         if check:
             c, tail = run_check(check, cwd)
@@ -633,6 +640,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 return f"{notice}{do_here(check, c, tail)}\n\nChanges by {label}, untested:\n{out[:2000]}"
             if c != 0:
                 failure = f"check `{check}` failed: {tail[-400:]}"
+                failed_try(job, a, model, code, began, failure)
                 continue
             return f"{notice}Done by {label}; check `{check}` exited 0, passed:\n{tail[-300:]}\n\nAgent notes:\n{out[:2000]}"
         if raw:
