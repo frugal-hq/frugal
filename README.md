@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.28.5-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.28.6-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
@@ -209,6 +209,7 @@ A: no plugins, E: frugal, F: caveman, G: ponytail, B: caveman + ponytail. `bench
 
 ## Versions
 
+- **0.28.6**: Each failed try of a delegated job is logged in `jobs.jsonl` under `failures`, with its account, model, exit code, seconds and reason, including a check that failed. The reply still names only the last one; Frugal Deck shows them all.
 - **0.28.5**: An `edit` delegate no longer hangs before its agent starts. On Windows, a command the server started inherited its stdin, the pipe Claude Code sends requests on, and stayed blocked until the next request arrived.
 - **0.28.4**: A delegated job logs its process id in `jobs.jsonl` while it runs, and the end of its stderr when it times out or is cancelled, so a hung agent can be found and diagnosed.
 - **0.28.3**: The handoff notice past each 150k tokens of context is sent again on the next message when Claude Code dropped it, instead of waiting for the next 150k.
