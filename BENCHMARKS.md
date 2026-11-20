@@ -21,6 +21,30 @@ Costs are the `total_cost_usd` Claude Code reports.
 
 ## Current batches
 
+### frugal 0.29.0 against no plugins, Haiku 4.5 and Sonnet 5.5
+
+ponytail's harness, all 39 tasks, n=2, 156 cells per model, both arms in one batch per model (2026-11-20, Claude Code 2.1.329; Haiku $8.68, Sonnet $11.12). Cost is the mean per run; "vs no plugins" is the geometric mean of the per-task cost ratio with a 90% bootstrap interval:
+
+| Model | Arm | Correct | Safe | Lines (median) | Lines (mean) | USD per run | vs no plugins | Cheaper on |
+|---|---|---|---|---|---|---|---|---|
+| Haiku 4.5 | no plugins | 0.987 | 0.962 | 47 | 95.7 | 0.0587 | 0% | |
+| | frugal | **1.000** | **0.974** | **25** | **46.0** | 0.0527 | -2.4% (-10.9% to +6.1%) | 16 of 39 tasks |
+| Sonnet 5.5 | no plugins | 1.000 | 1.000 | 64 | 83.6 | 0.0734 | 0% | |
+| | frugal | 1.000 | 1.000 | **31** | **41.6** | 0.0692 | -4.5% (-9.5% to +0.8%) | 23 of 39 |
+
+Cost vs no plugins by task group:
+
+| Model | Open-ended (15) | Template features (12) | Fixes, security, reuse (12) |
+|---|---|---|---|
+| Haiku 4.5 | -2.0% | -20.1% | +18.4% |
+| Sonnet 5.5 | -15.3% | +0.2% | +5.8% |
+
+On Haiku both arms missed `todo-null` safety once; plain Claude Code missed `trace-transfer` safety in 2 of 2 runs and frugal in 1 of 2, and plain Claude Code wrote no file in one `vibe-rename` run. Sonnet missed nothing.
+
+Against the 0.18.4 batch the gap narrowed (Haiku -6.6% to -2.4%, Sonnet -13.1% to -4.5%), mostly because plain Claude Code got cheaper: on Sonnet the baseline went from 0.0943 to 0.0734 USD per run (-22%) and from 73 to 64 median lines, while frugal went from 0.0806 to 0.0692 (-14%); on Haiku the baseline went from 0.0619 to 0.0587 and frugal from 0.0541 to 0.0527. The batches differ in runs per cell and Claude Code version, so this comparison is loose.
+
+**Fixed cost.** `t0_ok` in `bench.py` first gave +3,722 input tokens on Sonnet and +1,928 on Haiku, against +1,243 and +802 for 0.18.5. Most of the Sonnet jump came from the bench: claude.ai connectors (Claude Docs here) connect at a random point of startup, and frugal's MCP server delays the first request, so the connector reached every frugal run and only some no-plugin runs. With it connected in both arms, Sonnet's fixed cost is +1,686 tokens (28,529 against 30,215, one run each): `SKILL.md` once `/frugal` loads it 1,052, the descriptions of four more skills and two agents about 400, the accounts hint about 130, and the deferred `delegate` tool 17. `bench.py` now turns claude.ai connectors off for every condition (`ENABLE_CLAUDEAI_MCP_SERVERS=false`); Haiku's fixed cost is still to be remeasured that way. The ponytail harness runs with `--strict-mcp-config`, so the batch above was not affected. That flag also drops frugal's `delegate`, and the hooks still pointed the frugal arm at it (the accounts hint, and a note past the read budget); no run spent a call looking for it.
+
 ### Head-to-head: frugal 0.18.4 against ponytail 5.2.0, three models
 
 ponytail's own harness, all 39 tasks, n=3, 234 cells per model, both arms in one batch per model (Haiku 2026-10-15, Sonnet 2026-10-16, Opus 2026-10-16 to 20). ponytail ran from its v5.2.0 tag (`2961b52`) in its default `full` mode. Cost is the mean per run; "vs ponytail" is the geometric mean of the per-task cost ratio with a 90% bootstrap interval over tasks:

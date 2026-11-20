@@ -76,6 +76,8 @@ With an account set up, the `delegate` tool sends each task to the least-used ac
 
 On ponytail's own harness (39 tasks, 3 runs each), frugal 0.18.4 passed every check on all three models. It cost 38% less than plain Claude Code on Opus and 5.8 to 8.3% less than ponytail 5.2.0 on every model. Plain Claude Code missed checks on Haiku in 10 of 117 runs.
 
+frugal 0.29.0 (2026-11-20, 39 tasks, 2 runs each) cost 2.4% less than plain Claude Code on Haiku and 4.5% less on Sonnet, with half the lines; on Haiku it missed 2 checks in 78 runs against 4 for plain Claude Code. The gap narrowed since 0.18.4 mostly because plain Claude Code got cheaper (22% on Sonnet).
+
 **Where it loses.** Short one-off tasks cost 7 to 10% more than no plugins (0.25.2, four tasks, n=5): loading frugal adds 650 to 1,450 input tokens per call, which a 3-call task cannot win back. Long sessions and heavy tasks pay it back.
 
 Every number comes from headless Claude Code runs, checked automatically, with all arms in the same batch. Methods, per-task tables, and how to reproduce them are in [BENCHMARKS.md](BENCHMARKS.md).
