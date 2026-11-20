@@ -562,6 +562,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         level = "heavy"  # a long edit brief is multi-file work: on the standard level it ran past 10 minutes and started over
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
     failure, tried, relog, failed_kinds, check_fails = "", [], [], set(), set()
+    start = touched(cwd) if kind == "edit" else {}
     if check:
         text += f"\n\nDone when this bash command exits 0: {check}"
     for n in range(1, MAX_TRIES + 1):
@@ -659,7 +660,10 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         return f"{notice}Done by {label}.\n{out[:2000]}"
     if raw:
         return ""
-    return f"{relogin(relog)}frugal: no secondary account finished this{f' ({failure})' if failure else ''}. Do it here."
+    # Work a failed try left in the tree: without the list, the chat redid files that already existed.
+    left = sorted(f for f, t in touched(cwd).items() if start.get(f) != t) if kind == "edit" else []
+    changed = f" Changed, untested: {', '.join(left[:30])}; review that diff here before redoing any of it." if left else ""
+    return f"{relogin(relog)}frugal: no secondary account finished this{f' ({failure})' if failure else ''}.{changed} Do it here."
 
 
 SPEC = {
@@ -1476,7 +1480,7 @@ def selftest():
             wr.close()
         g.update(real)
     # A failed provider goes last; a timed-out try moves up to heavy: a strong account and 20 minutes.
-    real = {k: g[k] for k in ("run_cli", "load", "save", "log_job")}
+    real = {k: g[k] for k in ("run_cli", "load", "save", "log_job", "run_check", "touched")}
     accounts = [{"id": "o1", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"}, {"id": "o2", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"},
                 {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude"}]
     tries, replies = [], []
@@ -1489,6 +1493,14 @@ def selftest():
         job, replies[:] = {}, [(124, "", "timed out"), (1, "", "boom"), (0, "ok", "")]
         assert brief("big", "search", None, "standard", None, ".", job=job).startswith("Done by x"), tries
         assert tries == [("opencode", 600), ("claude", 1200), ("codex", 1200)] and [f["exit"] for f in job["failures"]] == [124, 1], (tries, job)
+        # A check that fails the same way after two accounts' work stops there and names what they left in the tree.
+        tries.clear()
+        replies[:] = [(0, "ok", "")] * 4
+        seen = []
+        g.update(run_check=lambda check, cwd, timeout=300: (1, "No such file: other.py"),
+                 touched=lambda cwd: (seen.append(1), {} if len(seen) == 1 else {"new.py": 1})[1])
+        r = brief("copy", "edit", "python -m py_compile new.py other.py", "standard", None, ".")
+        assert len(tries) == 2 and "Changed, untested: new.py;" in r, (tries, r)
     finally:
         g.update(real)
     return "selftest ok"
