@@ -559,7 +559,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     if level not in LEVELS and kind == "edit" and len(text) > 2500:
         level = "heavy"  # a long edit brief is multi-file work: on the standard level it ran past 10 minutes and started over
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
-    failure, tried, relog = "", [], []
+    failure, tried, relog, failed_kinds = "", [], [], set()
     if check:
         text += f"\n\nDone when this bash command exits 0: {check}"
     for n in range(1, MAX_TRIES + 1):
@@ -571,6 +571,8 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                     and not (servers and a["kind"] != "claude") and not blocked(a, data)]
             if not pool:
                 break
+            # After a failure another provider goes first: three free OpenCode models failed one after another on its server errors.
+            pool.sort(key=lambda x: x["kind"] in failed_kinds)
             a = pool[0]
             BUSY[a["id"]] = BUSY.get(a["id"], 0) + 1
         tried.append(a["id"])
@@ -633,6 +635,9 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         if code != 0 or not out:
             failure = (err or out or f"exit {code}")[-400:]
             failed_try(job, a, model, code, began, failure)
+            failed_kinds.add(a["kind"])
+            if code == 124 and level not in ("heavy", "max"):
+                level = "heavy"  # bigger than its level: the next try gets a strong account and 20 minutes instead of another 10
             continue
         if check:
             c, tail = run_check(check, cwd)
@@ -641,6 +646,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             if c != 0:
                 failure = f"check `{check}` failed: {tail[-400:]}"
                 failed_try(job, a, model, code, began, failure)
+                failed_kinds.add(a["kind"])
                 continue
             return f"{notice}Done by {label}; check `{check}` exited 0, passed:\n{tail[-300:]}\n\nAgent notes:\n{out[:2000]}"
         if raw:
@@ -1459,6 +1465,22 @@ def selftest():
     finally:
         if not wr.closed:
             wr.close()
+        g.update(real)
+    # A failed provider goes last; a timed-out try moves up to heavy: a strong account and 20 minutes.
+    real = {k: g[k] for k in ("run_cli", "load", "save", "log_job")}
+    accounts = [{"id": "o1", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"}, {"id": "o2", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"},
+                {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude"}]
+    tries, replies = [], []
+    g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (tries.append((argv[0], timeout)), replies.pop(0))[1],
+             load=lambda: {"accounts": [dict(a) for a in accounts]}, save=lambda data: None, log_job=lambda entry: None)
+    try:
+        replies[:] = [(1, "", "server error"), (0, "ok", "")]
+        assert brief("look", "search", None, "standard", None, ".").startswith("Done by x") and [t[0] for t in tries] == ["opencode", "codex"], tries
+        tries.clear()
+        job, replies[:] = {}, [(124, "", "timed out"), (1, "", "boom"), (0, "ok", "")]
+        assert brief("big", "search", None, "standard", None, ".", job=job).startswith("Done by x"), tries
+        assert tries == [("opencode", 600), ("claude", 1200), ("codex", 1200)] and [f["exit"] for f in job["failures"]] == [124, 1], (tries, job)
+    finally:
         g.update(real)
     return "selftest ok"
 
