@@ -455,7 +455,8 @@ def run_check(check, cwd, timeout=300):
 
 # The command could not run on this machine (missing tool, no permission, timeout); the code was never tested.
 ENV_FAIL = re.compile(r"command not found|is not recognized as an internal|permission denied while trying to connect to the docker"
-                      r"|cannot connect to the docker daemon|docker daemon is not running", re.I)
+                      r"|cannot connect to the docker daemon|docker daemon is not running|failed to connect to the docker api"
+                      r"|error during connect", re.I)
 
 
 def env_failure(code, out):
