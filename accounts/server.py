@@ -878,16 +878,16 @@ def rule(event):
     DIR.mkdir(exist_ok=True)
     state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "edits": 0, "delegated": 0, "agent": False}), encoding="utf-8")
     if first:
-        return (f"frugal: secondary accounts {ids} are set up. Delegate every bounded task with {TOOL}, level per task; "
+        return (f"frugal: secondary accounts are set up. Delegate every bounded task with {TOOL}, level per task; "
                 "keep here only design, judgment calls and the final check.")
-    return nudge(s.get("reads", 0), s.get("delegated", 0), ids)
+    return nudge(s.get("reads", 0), s.get("delegated", 0))
 
 
-def nudge(reads, delegated, ids):
+def nudge(reads, delegated):
     # The same line on every prompt went unread (one session got it 120 times and delegated 14 times in 34 prompts);
     # this one shows only after a prompt that explored here, and says how much.
     if reads > EXPLORE_BUDGET and not delegated:
-        return f"frugal: the last prompt ran {reads} reads and searches here and delegated none. Send bounded pieces to {ids} with {TOOL}."
+        return f"frugal: the last prompt ran {reads} reads and searches here and delegated none. Send bounded pieces to {TOOL}."
     return ""
 
 
@@ -1245,7 +1245,7 @@ def selftest():
     assert reads_only("cat a.py | grep -n x") and reads_only("cd src && git log --oneline -3 2>/dev/null") and reads_only("Get-Content f; ls")
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
-    assert nudge(EXPLORE_BUDGET + 1, 0, "x").startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1}") and nudge(9, 1, "x") == "" and nudge(EXPLORE_BUDGET, 0, "x") == ""
+    assert nudge(EXPLORE_BUDGET + 1, 0).startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1}") and nudge(9, 1) == "" and nudge(EXPLORE_BUDGET, 0) == ""
     cfg = Path(tempfile.mkdtemp())
     (cfg / ".claude.json").write_text(json.dumps({"mcpServers": {"sm": {"command": "a"}}, "projects": {
         str(cfg).replace("\\", "/"): {"mcpServers": {"p": {"command": "b"}}}, "elsewhere": {"mcpServers": {"q": {"command": "c"}}}}}), encoding="utf-8")
