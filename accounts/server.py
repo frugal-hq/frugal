@@ -561,7 +561,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     if level not in LEVELS and kind == "edit" and len(text) > 2500:
         level = "heavy"  # a long edit brief is multi-file work: on the standard level it ran past 10 minutes and started over
     raw = kind == "note"  # a heads-up check wants the bare answer, or "" when no account answered
-    failure, tried, relog, failed_kinds = "", [], [], set()
+    failure, tried, relog, failed_kinds, check_fails = "", [], [], set(), set()
     if check:
         text += f"\n\nDone when this bash command exits 0: {check}"
     for n in range(1, MAX_TRIES + 1):
@@ -649,6 +649,9 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 failure = f"check `{check}` failed: {tail[-400:]}"
                 failed_try(job, a, model, code, began, failure)
                 failed_kinds.add(a["kind"])
+                if failure in check_fails:
+                    break  # the same check output after two accounts' work: the check itself fails, another try only redoes it
+                check_fails.add(failure)
                 continue
             return f"{notice}Done by {label}; check `{check}` exited 0, passed:\n{tail[-300:]}\n\nAgent notes:\n{out[:2000]}"
         if raw:
@@ -668,7 +671,7 @@ SPEC = {
         "task": {"type": "string", "description": "Goal, exact paths, done-when. With kind run it is never executed: it only guides the explanation of a failure."},
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
-        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once; put every command to run here, chained with &&. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
+        "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right; only this brief's own files, never ones a parallel brief makes. With kind run: the command to run, once; put every command to run here, chained with &&. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
         "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the folder the check starts with `cd` into, else the session's project dir. Set it when the work is outside the project."},
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed. With kind run: the command's time limit, 10 minutes, heavy 20, max 30."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
