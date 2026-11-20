@@ -9,8 +9,6 @@ description: Low-token mode. Terse replies, small context, fewer calls; code, an
 
 **First**, once per task, in your first tool call batch: a task that writes, fixes, or reviews code reads `<base directory>/code.md` unless "frugal code rules" are already in context (on Opus or Fable only past 3 tool calls); past 3 tool calls, the user's 10th message, or names after `/frugal` also read `<base directory>/core.md`. Arguments with a `Read first:` line (a handoff): read those paths in that same first batch, before replying or asking anything.
 
-**Model fit:** session two tiers off the task (a lookup on Opus or Fable, architecture or an ambiguous bug on Haiku): read `<base directory>/modules/session.md`, follow Model fit.
-
 Active until "normal mode". Every call re-reads the context: keep it small, make fewer calls.
 
 **Project instructions** (CLAUDE.md, AGENTS.md, rule files, conventions the user set for the project or folder) win over every frugal default: language, format, commits, tests, style. Frugal only trims what they leave open. Carry the ones that apply into every handoff, delegated brief, subagent prompt and new-chat prompt.
