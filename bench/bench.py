@@ -130,7 +130,10 @@ def run_one(job, model):
         cmd += ["--settings", cond_settings(cond), "--disallowedTools", "AskUserQuestion"]
         if cond == "V":
             cmd += ["--plugin-dir", os.environ["FRUGAL_VARIANT_DIR"]]
-        p = subprocess.run(cmd, cwd=work, capture_output=True, text=True, encoding="utf-8", timeout=900)
+        # claude.ai connectors connect at a random point of startup; a plugin MCP server delays the first request, so
+        # they reached V's context and not A's (+2k tok on Sonnet t0_ok in 0.29.0). Off for every condition.
+        env = {**os.environ, "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+        p = subprocess.run(cmd, cwd=work, capture_output=True, text=True, encoding="utf-8", env=env, timeout=900)
         stream += p.stdout
         rcs.append(p.returncode)
         if "hit your session limit" in p.stdout:  # not saved, so a later run with the same --out retries it
