@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.28.6-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.29.0-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
@@ -47,11 +47,11 @@ frugal covers what caveman and ponytail do. If they are enabled, disable them: t
 
 ## What it does
 
-- **Small, loaded per task.** `/frugal` loads a 3KB skill. Rules for longer tasks (`core.md`), code (`code.md`) and modules (analysis, delegation, reviews, session handoffs) load only when a task needs them. Force a module with `/frugal analysis` or `/frugal coding agents`.
+- **Small, loaded per task.** `/frugal` loads a 3KB skill. Rules for longer tasks (`core.md`), code (`code.md`) and modules (analysis, delegation, reviews, session handoffs) load only when a task needs them, and a hook never pastes rules already in context. Force a module with `/frugal analysis` or `/frugal coding agents`.
 - **Short replies, exact facts.** No filler, terms and numbers kept exact, APIs and versions verified instead of guessed. It builds the sensible default instead of stopping to ask.
 - **Minimal code that keeps quality.** Reuse first, stdlib before new dependencies, root-cause fixes, one runnable check. It never cuts validation, security, accessibility, or error handling that prevents data loss.
 - **Cheaper models for bounded work.** Searches go to a `haiku` subagent and bounded edits to `sonnet`, passed per call, so your settings do not change.
-- **Session handoffs.** Past each 150k tokens of context, it ends at a natural break with a block to paste into a fresh chat.
+- **Session handoffs.** Past 150k tokens of context, and again every 50k, it ends at a natural break with a block to paste into a fresh chat.
 - **Opt-in extras.** A humanizer for text people read, and a `commits` skill that follows your repo's commit convention.
 
 ## Secondary accounts
@@ -82,6 +82,7 @@ Every number comes from headless Claude Code runs, checked automatically, with a
 
 ## Versions
 
+- **0.29.0**: A delegated `run` check gets 10, 20 or 30 minutes by level instead of a fixed 5. After a failed try another provider goes first, and a timeout moves the next try up to heavy. Jobs of a session that ends are logged as cancelled instead of staying running. The hook pastes the core and session rules only when they are not already in context (the 10th message, or after a compaction), sends one line on later rounds, loads the code rules again after a compaction, and no longer takes words like `add` or `test` as code. The context notice repeats every 50k tokens past 150k. Code rules ask for quiet test and build output; session rules warn that switching model or MCP servers mid-chat breaks the prompt cache.
 - **0.28.6**: Each failed try of a delegated job is logged in `jobs.jsonl` under `failures`, with its account, model, exit code, seconds and reason, including a check that failed. The reply still names only the last one; Frugal Deck shows them all.
 - **0.28.5**: An `edit` delegate no longer hangs before its agent starts. On Windows, a command the server started inherited its stdin, the pipe Claude Code sends requests on, and stayed blocked until the next request arrived.
 - **0.28.4**: A delegated job logs its process id in `jobs.jsonl` while it runs, and the end of its stderr when it times out or is cancelled, so a hung agent can be found and diagnosed.
