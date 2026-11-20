@@ -443,13 +443,13 @@ def bash():
     return next((p for p in [found, *git] if p and os.path.isfile(p) and "system32" not in p.lower()), None)
 
 
-def run_check(check, cwd):
+def run_check(check, cwd, timeout=300):
     sh = bash()
     if not sh:
         return 127, "bash not found; on Windows it comes with Git for Windows"
-    r = run_tree([sh, "-c", check], 300, cwd=cwd)
+    r = run_tree([sh, "-c", check], timeout, cwd=cwd)
     if r is None:
-        return 124, "check timed out after 5 minutes"
+        return 124, f"check timed out after {timeout // 60} minutes"
     return r[0], (r[1] + r[2]).strip()
 
 
@@ -469,7 +469,7 @@ def do_here(check, code, out):
 
 def run_brief(text, check, level, effort, cwd, job):
     # The check runs once, here; its exit code and output are the result. An agent only explains a failure, from that output.
-    code, out = run_check(check, cwd)
+    code, out = run_check(check, cwd, TIMEOUT.get(level, 600))  # a data build ran past the old fixed 5 minutes and came back to the chat
     if env_failure(code, out):
         return do_here(check, code, out)
     if code == 0:
@@ -662,7 +662,7 @@ SPEC = {
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
         "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right. With kind run: the command to run, once; put every command to run here, chained with &&. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
         "cwd": {"type": "string", "description": "Directory the work happens in (sandbox root, check runs there). Default: the folder the check starts with `cd` into, else the session's project dir. Set it when the work is outside the project."},
-        "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed."},
+        "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed. With kind run: the command's time limit, 10 minutes, heavy 20, max 30."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
         "mcp": {"type": "array", "items": {"type": "string"},
                 "description": "MCP servers of this session the task needs (the <name> in mcp__<name>__ tools). Only a Claude account takes it."},
