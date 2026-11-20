@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs on every user prompt; prints nothing unless /frugal is active in this session.
-# - First code-looking prompt: injects code.md, so the model has the code rules without spending a turn on Read.
+# - First code-looking prompt (clear signals only; a miss costs one Read, since SKILL.md has the model read code.md): injects code.md, so the model has the code rules without spending a turn on Read.
 # - 10th prompt, then every 15th: injects core.md and session.md (a skill cannot count messages reliably; a hook can).
 # - Context past each 150k tokens: injects the handoff rule (message count is a poor proxy for what each message re-sends).
 # - Pasted handoff: a /frugal line inside pasted text is not run as a command, so tell the model to load the skill until it does.
@@ -50,7 +50,7 @@ if [ -n "$round" ]; then
   exit 0
 fi
 [ -f "$dir/code-$sid" ] && exit 0
-printf '%s' "$prompt" | grep -qiE '\b(implement|fix|bug|refactor|endpoint|component|function|class|method|test|crash|exception|traceback|migrat|review|diff|commit|compile|build|add|api|script|code)|\.(py|ts|tsx|js|jsx|go|rs|java|kt|cs|rb|php|cpp|c|h|sql|css|html|sh)\b' || exit 0
+printf '%s' "$prompt" | grep -qiE '/frugal(:frugal)? [^\\]*\bcod(e|ing)\b|\b(implement\w*|refactor\w*|endpoints?|tracebacks?|exceptions?|stack ?traces?|compil\w*|migrat\w*|bugs?|crash\w*|regex\w*|functions?|unit tests?|failing tests?|tests? fail\w*|pull requests?|c(o|ó)digo|funci(o|ó)n\w*)\b|```|\.(py|ts|tsx|js|jsx|go|rs|java|kt|cs|rb|php|cpp|c|h|sql|css|html|sh)\b' || exit 0
 active || exit 0
 touch "$dir/code-$sid"
 echo "frugal code rules (loaded by a hook; do not Read code.md):"
