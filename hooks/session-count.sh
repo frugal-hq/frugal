@@ -3,7 +3,7 @@
 # - First code-looking prompt (clear signals only; a miss costs one Read, since SKILL.md has the model read code.md): injects code.md, so the model has the code rules without spending a turn on Read.
 # - 10th prompt, every 15th after it, and the prompt after a compaction: injects core.md and session.md unless already
 #   in context (a skill cannot count messages reliably; a hook can); with both loaded, a round gets one reminder line.
-# - Context past each 150k tokens: injects the handoff rule (message count is a poor proxy for what each message re-sends).
+# - Context past 150k tokens, then every 50k: the handoff notice, with the handoff rule the first time (message count is a poor proxy for what each message re-sends).
 # - Pasted handoff: a /frugal line inside pasted text is not run as a command, so tell the model to load the skill until it does.
 # Keeps small per-session marker files in CLAUDE_PLUGIN_DATA; prune by age if that ever matters.
 input=$(cat)
@@ -41,13 +41,18 @@ missing=; seen core || missing="$skill/core.md"; seen session || missing="$missi
 load=; { [ -n "$round" ] || grep -q '"subtype":"compact_boundary"' "$transcript" 2>/dev/null; } && load=$missing
 # Context of the last reply: input plus cached tokens from its usage record.
 ctx=$(grep -o '"usage":{"input_tokens":[0-9]*,"cache_creation_input_tokens":[0-9]*,"cache_read_input_tokens":[0-9]*' "$transcript" 2>/dev/null | tail -1 | grep -o '[0-9][0-9]*' | awk '{s+=$1} END {print s+0}')
-level=$(( ${ctx:-0} / 150000 ))
+# Notice levels: 1 at 150k, then one more every 50k.
+level=$(( ${ctx:-0} < 150000 ? 0 : (ctx - 150000) / 50000 + 1 ))
 # Last level whose notice reached the model, read from the transcript: a marker file is spent even when
 # Claude Code drops that run's output. A compaction boundary re-arms it.
-fired=$(grep -oE '"subtype":"compact_boundary"|"hookEvent":"UserPromptSubmit","content":"([^"\]|\.)*frugal: the context is about [0-9]+k' "$transcript" 2>/dev/null | awk '/compact_boundary/ {k = 0; next} {sub(/k$/, ""); sub(/.* /, ""); k = $0} END {print int(k * 1000 / 150000)}')
+fired=$(grep -oE '"subtype":"compact_boundary"|"hookEvent":"UserPromptSubmit","content":"([^"\]|\.)*frugal: the context is about [0-9]+k' "$transcript" 2>/dev/null | awk '/compact_boundary/ {k = 0; next} {sub(/k$/, ""); sub(/.* /, ""); k = $0} END {print (k < 150 ? 0 : int((k - 150) / 50) + 1)}')
 if [ "$level" -gt "${fired:-0}" ] && active; then
-  echo "frugal: the context is about $(( ctx / 1000 ))k tokens, re-sent on every message. If work remains, end this reply or the next at a natural breakpoint with the handoff block below."
-  case $load in *session.md*) ;; *) sed -n '/^\*\*Handoff\.\*\*/,$p' "$skill/modules/session.md" ;; esac
+  if [ "${fired:-0}" -eq 0 ]; then
+    echo "frugal: the context is about $(( ctx / 1000 ))k tokens, re-sent on every message. If work remains, end this reply or the next at a natural breakpoint with the handoff block below."
+    case $load in *session.md*) ;; *) sed -n '/^\*\*Handoff\.\*\*/,$p' "$skill/modules/session.md" ;; esac
+  else
+    echo "frugal: the context is about $(( ctx / 1000 ))k tokens, re-sent on every message. If work remains, end this reply or the next at a natural breakpoint with the frugal handoff block."
+  fi
 fi
 if [ -n "$load$round" ]; then
   active || exit 0
