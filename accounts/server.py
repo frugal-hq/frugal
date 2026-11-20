@@ -758,7 +758,7 @@ def progress_message(req, start):
 
 def serve(inp=None, outp=None):
     # Each tools/call runs in its own thread, so the loop keeps reading: pings, cancellations, and the end of the session.
-    inp, outp, out_lock, live = inp or sys.stdin, outp or sys.stdout, threading.Lock(), {}
+    inp, outp, out_lock, live, workers = inp or sys.stdin, outp or sys.stdout, threading.Lock(), {}, []
 
     def send(msg):
         with out_lock:
@@ -805,7 +805,8 @@ def serve(inp=None, outp=None):
             continue
         if method == "tools/call":
             live[rid] = Request()
-            threading.Thread(target=call, args=(rid, msg.get("params") or {}, live[rid]), daemon=True).start()
+            workers = [t for t in workers if t.is_alive()] + [threading.Thread(target=call, args=(rid, msg.get("params") or {}, live[rid]), daemon=True)]
+            workers[-1].start()
             continue
         if method == "initialize":
             result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
@@ -820,6 +821,9 @@ def serve(inp=None, outp=None):
         send({"jsonrpc": "2.0", "id": rid, "result": result})
     for req in list(live.values()):  # the session ended: no agent keeps working for nobody
         req.cancel()
+    end = time.time() + 10
+    for t in workers:  # their jobs log as cancelled before the process exits; else they stayed "running" forever
+        t.join(max(0, end - time.time()))
 
 
 # Hooks keep per-session state (rule shown, reads this prompt, waived denials) next to the accounts file.
