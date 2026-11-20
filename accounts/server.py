@@ -1493,6 +1493,8 @@ if __name__ == "__main__":
     # Windows pipes default to the ANSI code page: a brief with ” or Á closed the server ("Connection closed") and garbled every other accent.
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8")
+    if not (os.environ.get("LC_ALL") or os.environ.get("LANG")):
+        os.environ["LANG"] = "C.UTF-8"  # bash -c skips the profile that sets it; grep -P then fails on every check
     cmd = sys.argv[1:]
     if not cmd:
         serve()
