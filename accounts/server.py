@@ -465,7 +465,8 @@ def env_failure(code, out):
 
 def do_here(check, code, out):
     return (f"frugal: check `{check}` exited {code} and could not run here:\n{out[-800:]}\n"
-            "Do it here: run the same command again in your shell and it goes through.")
+            "Do it here: run the same command in your shell. If it fails the same way there, the tool is missing or not running "
+            "on this machine (start or install it); the code was not tested.")
 
 
 def run_brief(text, check, level, effort, cwd, job):
