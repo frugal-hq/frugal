@@ -132,8 +132,8 @@ def own(a):
 
 
 def session_mcp(cwd):
-    """This session's MCP servers, user scope plus the project's. Only a Claude delegate gets them, and only the ones a task names:
-    which agents may reach a server's data is each project's rule, and frugal never hands these to Codex, Grok or OpenCode.
+    """This session's MCP servers, user scope plus the project's. A delegate gets only the ones a task names; Grok never,
+    and Codex or OpenCode never a server in claude_only_mcp: which agents may reach a server's data is each project's rule.
     In a Frugal Deck chat, FRUGAL_DECK_MCP holds the chat's resolved set: the account's servers its allow and deny lists pass, plus the Deck's."""
     folder = os.environ.get("CLAUDE_CONFIG_DIR")
     try:
@@ -187,12 +187,20 @@ def mcp_rule(server, tool=None):
 
 
 def list_tools(conf):
-    """An HTTP MCP server's tools over streamable HTTP, or None when they cannot be listed."""
-    import urllib.request
+    """An MCP server's tools, over streamable HTTP or from a stdio server started for the purpose, or None when they cannot be listed."""
+    import queue, urllib.request
     # Cloudflare's browser check (error 1010) refuses urllib's default Python-urllib agent.
     head = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": "frugal", **(conf.get("headers") or {})}
+    proc, lines, end = None, queue.Queue(), time.time() + 30
 
     def call(body):
+        if proc:
+            proc.stdin.write(json.dumps(body) + "\n")
+            proc.stdin.flush()
+            while "id" in body:
+                if (m := json.loads(lines.get(timeout=max(0.1, end - time.time())))).get("id") == body["id"]:
+                    return m
+            return None
         with urllib.request.urlopen(urllib.request.Request(conf["url"], json.dumps(body).encode(), head), timeout=20) as r:
             if sid := r.headers.get("Mcp-Session-Id"):
                 head["Mcp-Session-Id"] = sid
@@ -201,6 +209,11 @@ def list_tools(conf):
         return json.loads(data[-1] if data else text) if "id" in body else None
 
     try:
+        if not conf.get("url"):
+            proc = subprocess.Popen([shutil.which(conf["command"]) or conf["command"], *(conf.get("args") or [])], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={**os.environ, **(conf.get("env") or {})},
+                                    text=True, encoding="utf-8", start_new_session=os.name != "nt")
+            threading.Thread(target=lambda: [lines.put(x) for x in proc.stdout], daemon=True).start()
         call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
               "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "frugal", "version": "1"}}})
         call({"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -210,8 +223,11 @@ def list_tools(conf):
             tools += res["tools"]
             if not (cursor := res.get("nextCursor")):
                 return tools
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, queue.Empty):
         return None
+    finally:
+        if proc:
+            kill_tree(proc)
 
 
 def cached_tools(name, tools=None):
@@ -231,12 +247,9 @@ def cached_tools(name, tools=None):
 
 def mcp_rules(servers):
     """A delegate gets only the tools a server marks readOnlyHint and is denied the rest: it can read a ticket, never answer one.
-    Returns (allowed, denied, servers whose tools could not be listed)."""
-    allow, deny, failed = [], [], []
+    Returns (allowed, denied, servers whose tools could not be listed, {server: its read-only tool names})."""
+    allow, deny, failed, ro = [], [], [], {}
     for name, conf in servers.items():
-        if not conf.get("url"):
-            allow.append(mcp_rule(name))  # frugal: a stdio server keeps all its tools; list them over stdio to make it read-only too
-            continue
         tools = list_tools(conf)
         if tools is None:
             tools = list_tools(conf)  # a server still connecting often answers the second time
@@ -244,9 +257,37 @@ def mcp_rules(servers):
         if tools is None:
             failed.append(name)
             continue
+        ro[name] = [t["name"] for t in tools if (t.get("annotations") or {}).get("readOnlyHint")]
         for t in tools:
-            (allow if (t.get("annotations") or {}).get("readOnlyHint") else deny).append(mcp_rule(name, t["name"]))
-    return allow, deny, failed
+            (allow if t["name"] in ro[name] else deny).append(mcp_rule(name, t["name"]))
+    return allow, deny, failed, ro
+
+
+def mcp_for(kind, servers, ro):
+    """Codex -c overrides, or OpenCode's config, for this session's servers: (args, env). Header and env values go in env vars,
+    never on the command line. Codex enables only the read-only tools; OpenCode denies the server's other tools."""
+    args, env, conf = [], {}, {"mcp": {}, "permission": {}}
+    for i, (name, c) in enumerate(servers.items()):
+        key, heads, envs = mcp_rule(name)[5:], c.get("headers") or {}, c.get("env") or {}
+        if kind == "opencode":
+            conf["mcp"][key] = ({"type": "remote", "url": c["url"], "headers": heads} if c.get("url")
+                                else {"type": "local", "command": [c["command"], *(c.get("args") or [])], "environment": envs})
+            conf["permission"].update({f"{key}_*": "deny", **{f"{key}_{mcp_rule(t)[5:]}": "allow" for t in ro[name]}})  # the last matching rule wins
+            continue
+        p = f"mcp_servers.{key}."
+        if c.get("url"):
+            var = {h: f"FRUGAL_MCP_{i}_{j}" for j, h in enumerate(heads)}
+            env.update({var[h]: v for h, v in heads.items()})
+            args += ["-c", p + "url=" + json.dumps(c["url"])]
+            args += ["-c", p + "env_http_headers={" + ", ".join(f"{json.dumps(h)} = {json.dumps(v)}" for h, v in var.items()) + "}"] if var else []
+        else:
+            env.update(envs)
+            args += ["-c", p + "command=" + json.dumps(c["command"]), "-c", p + "args=" + json.dumps(c.get("args") or [])]
+            args += ["-c", p + "env_vars=" + json.dumps(list(envs))] if envs else []
+        args += ["-c", p + "enabled_tools=" + json.dumps(ro[name])]
+    if kind == "opencode":
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(conf)
+    return args, env
 
 
 def clear_needs_auth(config_dir, names):
@@ -319,7 +360,7 @@ def blocked(a, data):
             and not data.get("opencode_allow_training", False))
 
 
-def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=()):
+def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=(), mcp_args=()):
     if a["kind"] == "claude" and kind == "note":
         return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
@@ -333,13 +374,15 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mc
     if a["kind"] == "grok":
         # A headless grok refuses every call that needs approval and still exits 0, so it always approves; search keeps read tools and the shell, as Claude's does.
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
+        # MCP servers come in an agent file; deny rules (server__tool) block the tools that are not read-only, even under --always-approve.
+        tools += (["--agent", mcp_file] if mcp_file else []) + [x for r in mcp_deny for x in ("--deny", f"MCPTool({r[5:]})")]
         return ["grok", "--no-auto-update", "-m", model, "--effort", effort, "--always-approve", "--output-format", "json", *tools]
     if a["kind"] == "opencode":
         # --auto approves what is not denied; the plan agent denies edits, so search stays read-only (tested on opencode 1.19.5)
         return ["opencode", "run", "-m", model, "--variant", effort, "--agent", "plan" if kind == "search" else "build", "--auto", "--format", "json"]
     sandbox = ["-s", "workspace-write"] if kind in ("edit", "run") else []
     off = [x for n in mcp_off for x in ("-c", f"mcp_servers.{n}.enabled=false")]  # only servers its config has: an unknown one breaks codex
-    return ["codex", "exec", "--skip-git-repo-check", *(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}", *off, *sandbox, "-"]
+    return ["codex", "exec", "--skip-git-repo-check", *(["-m", model] if model else []), "-c", f"model_reasoning_effort={effort}", *off, *mcp_args, *sandbox, "-"]
 
 
 class Cancelled(Exception):
@@ -555,7 +598,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     servers, expired = with_auth({n: found[n] for n in mcp})
     if expired:
         return f"frugal: this session's login to {', '.join(expired)} expired; call one of its tools here once to refresh it, then delegate again."
-    allow, deny, failed = mcp_rules(servers)
+    allow, deny, failed, ro = mcp_rules(servers)
     if failed:
         return f"frugal: could not list the tools of {', '.join(failed)} to keep the delegate read-only. Do it here."
     if level not in LEVELS and kind == "edit" and len(text) > 2500:
@@ -569,9 +612,11 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         with LOCK:
             data = load()
             # A heads-up note carries the session transcript, which never goes to Grok or OpenCode.
-            # A task that needs this session's MCP servers goes only to Claude accounts.
+            # A task needing a claude_only_mcp server never goes to Codex, Grok or OpenCode, nor one needing a server with an
+            # mcp_kinds list to an account of another kind; a server without a list goes to any kind.
+            only, kinds = data.get("claude_only_mcp", []), data.get("mcp_kinds", {})  # both set per server in Frugal Deck's MCP servers
             pool = [a for a in order(data["accounts"], BUSY, level) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode"))
-                    and not (servers and a["kind"] != "claude") and not blocked(a, data)]
+                    and not any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers) and not blocked(a, data)]
             if not pool:
                 break
             # After a failure another provider goes first: three free OpenCode models failed one after another on its server errors.
@@ -593,23 +638,30 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             prompt = f"{CODEX_RULES}\n\n{prompt}"  # Codex cannot load the skill, so it gets the essentials
         env = child_env(a, {DELEGATED: "1"})
         env.pop("FRUGAL_DECK_MCP", None)  # the chat's server configs, which may carry keys; a delegate gets only its servers, in mcp_file
-        only = data.get("claude_only_mcp", [])  # MCP servers no other agent may reach
         if a["kind"] != "claude":
             # frugal: a token is found by the server's name in the variable (SERVICEMINDER_MCP_TOKEN); read bearer_token_env_var if one is named otherwise.
             env = {k: v for k, v in env.items() if not any(n.upper() in k.upper() for n in only)}
         if a["kind"] == "grok":
             env.update(GROK_CLAUDE_MCPS_ENABLED="false", GROK_CLAUDE_HOOKS_ENABLED="false")  # grok loads Claude's MCP servers and hooks by default
         off = [n for n in only if n in codex_mcp()] if a["kind"] == "codex" else []
+        mcp_args, mcp_env = mcp_for(a["kind"], servers, ro) if servers and a["kind"] in ("codex", "opencode") else ([], {})
+        env.update(mcp_env)
         mcp_file = None
-        if servers:  # a file, not an argument: server configs can carry tokens, and a command line is visible to every process
-            fd, mcp_file = tempfile.mkstemp(suffix=".json")
+        if servers and a["kind"] in ("claude", "grok"):  # a file, not an argument: server configs can carry tokens, and a command line is visible to every process
+            fd, mcp_file = tempfile.mkstemp(suffix=".json" if a["kind"] == "claude" else ".md")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"mcpServers": servers}, f)
+                if a["kind"] == "claude":
+                    json.dump({"mcpServers": servers}, f)
+                else:  # a Grok agent file; its frontmatter takes ACP's server list, written as JSON, which YAML reads too
+                    pairs = lambda d: [{"name": k, "value": v} for k, v in (d or {}).items()]
+                    acp = [{"type": "http", "name": mcp_rule(n)[5:], "url": c["url"], "headers": pairs(c.get("headers"))} if c.get("url") else
+                           {"name": mcp_rule(n)[5:], "command": c["command"], "args": c.get("args") or [], "env": pairs(c.get("env"))} for n, c in servers.items()]
+                    f.write(f"---\nname: frugal-mcp\ndescription: frugal delegate with MCP servers\nmcpServers: {json.dumps(acp)}\n---\n")
         try:
             if servers and a.get("config_dir"):
                 clear_needs_auth(a["config_dir"], [n for n, c in servers.items() if c.get("url")])
             before = touched(cwd) if kind == "edit" else {}
-            code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, allow, deny), prompt, cwd, env, TIMEOUT.get(level, 600))
+            code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, allow, deny, mcp_args), prompt, cwd, env, TIMEOUT.get(level, 600))
             # A timed-out edit leaves its work in the tree: the next account would start over on top of it, so hand it back as is.
             if code == 124 and kind == "edit" and (left := sorted(f for f, t in touched(cwd).items() if before.get(f) != t)):
                 return (f"{relogin(relog)}frugal: {a['id']} timed out after changing {', '.join(left[:30])}, untested. "
@@ -680,7 +732,7 @@ SPEC = {
         "level": {"type": "string", "enum": LEVELS, "description": "light: searches, reads. standard: edits, test runs. heavy: hard multi-file work. max: after heavy failed. With kind run: the command's time limit, 10 minutes, heavy 20, max 30."},
         "effort": {"type": "string", "enum": EFFORTS[:-1], "description": "Overrides the effort of the level."},
         "mcp": {"type": "array", "items": {"type": "string"},
-                "description": "MCP servers of this session the task needs (the <name> in mcp__<name>__ tools). Only a Claude account takes it."},
+                "description": "MCP servers of this session the task needs (the <name> in mcp__<name>__ tools). The delegate gets those servers' read-only tools only."},
     }},
 }
 
@@ -1212,6 +1264,7 @@ def selftest():
     assert choose(grok, "edit", "heavy") == ("grok-4.6", "high")
     assert "--always-approve" in argv_for(grok, "edit", "grok-4.6", "high") and "--tools" not in argv_for(grok, "edit", "grok-4.6", "high")
     assert argv_for(grok, "search", "grok-4.6", "low")[-2:] == ["--tools", "read_file,grep,list_dir,run_terminal_cmd"]
+    assert argv_for(grok, "search", "grok-4.6", "low", (), "a.md", (), ["mcp__py__send_x"])[-4:] == ["--agent", "a.md", "--deny", "MCPTool(py__send_x)"]
     assert AUTH.search("Error: Not signed in. To authenticate")
     oc = {"id": "o", "kind": "opencode", "model": "opencode/glm-5.3-flash-free", "data_dir": "/d"}
     assert choose(oc, "search", "max") == ("opencode/glm-5.3-flash-free", "high") and account_env(oc) == {"XDG_DATA_HOME": "/d"}
@@ -1243,6 +1296,10 @@ def selftest():
     prune()
     assert not old.exists()
     assert reads_only("cat a.py | grep -n x") and reads_only("cd src && git log --oneline -3 2>/dev/null") and reads_only("Get-Content f; ls")
+    a, e = mcp_for("codex", {"p y": {"url": "https://p/", "headers": {"Authorization": "Bearer t"}}, "sm": {"command": "a", "env": {"K": "v"}}}, {"p y": ["get"], "sm": ["q"]})
+    assert a == ["-c", 'mcp_servers.p_y.url="https://p/"', "-c", 'mcp_servers.p_y.env_http_headers={"Authorization" = "FRUGAL_MCP_0_0"}', "-c", 'mcp_servers.p_y.enabled_tools=["get"]',
+                 "-c", 'mcp_servers.sm.command="a"', "-c", "mcp_servers.sm.args=[]", "-c", 'mcp_servers.sm.env_vars=["K"]', "-c", 'mcp_servers.sm.enabled_tools=["q"]'] and e == {"FRUGAL_MCP_0_0": "Bearer t", "K": "v"}
+    assert json.loads(mcp_for("opencode", {"py": {"url": "https://p/"}}, {"py": ["get x"]})[1]["OPENCODE_CONFIG_CONTENT"])["permission"] == {"py_*": "deny", "py_get_x": "allow"}
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
     assert nudge(EXPLORE_BUDGET + 1, 0).startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1}") and nudge(9, 1) == "" and nudge(EXPLORE_BUDGET, 0) == ""
@@ -1319,6 +1376,8 @@ def selftest():
     prompts, g = [], globals()
     real = {k: g[k] for k in ("run_cli", "load", "save")}
     real_list_tools = list_tools
+    assert list_tools({"command": sys.executable, "args": ["-c", 'import json, os, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if m.get("method") == "tools/list":\n        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"tools": [{"name": os.environ["T"]}]}}), flush=True)\n    elif "id" in m:\n        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {}}), flush=True)\n'], "env": {"T": "get_y"}}) == [{"name": "get_y"}]
+    assert list_tools({"command": "frugal-no-such-command"}) is None
     g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
              load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None)
     envs = []
@@ -1375,8 +1434,8 @@ def selftest():
                             "own": {"url": "https://p/", "headers": {"authorization": "x"}}}, now=1000)
         assert s["py"]["headers"] == {"Authorization": "Bearer tok"} and "REFRESH" not in json.dumps(s) and exp == ["old"]
         assert s["sm"] == {"command": "a"} and s["own"]["headers"] == {"authorization": "x"}
-        g["list_tools"] = lambda conf: None if "bad" in conf["url"] else [{"name": "get_x", "annotations": {"readOnlyHint": True}}, {"name": "send_x"}]
-        assert mcp_rules({"py": {"url": "https://p/"}, "sm": {"command": "a"}, "b": {"url": "https://bad/"}}) == (["mcp__py__get_x", "mcp__sm"], ["mcp__py__send_x"], ["b"])
+        g["list_tools"] = lambda conf: None if "bad" in conf.get("url", "") else [{"name": "get_x", "annotations": {"readOnlyHint": True}}, {"name": "send_x"}]
+        assert mcp_rules({"py": {"url": "https://p/"}, "sm": {"command": "a"}, "b": {"url": "https://bad/"}}) == (["mcp__py__get_x", "mcp__sm__get_x"], ["mcp__py__send_x", "mcp__sm__send_x"], ["b"], {"py": ["get_x"], "sm": ["get_x"]})
         g["list_tools"] = real_list_tools
         (cfg / "mcp-needs-auth-cache.json").write_text(json.dumps({"py": {}, "x": {}}), encoding="utf-8")
         clear_needs_auth(cfg, ["py"])
@@ -1390,7 +1449,19 @@ def selftest():
         assert k2 == "claude" and "FRUGALTEST_SERVICEMINDER_TOKEN" in e2 and "--mcp-config" not in a1
         assert "FRUGAL_DECK_MCP" not in e1 and "FRUGAL_DECK_MCP" not in e2
         del os.environ["FRUGAL_DECK_MCP"]
-        # A task naming an MCP server skips the others and reaches Claude with only that server; an unknown name runs nowhere.
+        # A task naming an MCP server reaches only the account kinds on its mcp_kinds list, with only that server; Claude alone when
+        # the server is Claude-only; an unknown name runs nowhere.
+        accts = [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]
+        g["load"] = lambda: {"mcp_kinds": {"sm": ["opencode"]}, "accounts": accts}
+        assert brief("look up a customer", "search", None, None, None, str(cfg), ["sm"]).startswith("Done by") and envs[-1][0] == "opencode"
+        assert list(json.loads(envs[-1][1]["OPENCODE_CONFIG_CONTENT"])["mcp"]) == ["sm"]
+        g["load"] = lambda: {"mcp_kinds": {"sm": ["grok"]}, "accounts": accts}
+        assert brief("look up a customer", "search", None, None, None, str(cfg), ["sm"]).startswith("Done by") and envs[-1][0] == "grok"
+        argv = envs[-1][2]
+        assert argv[argv.index("--agent") + 1].endswith(".md") and not os.path.exists(argv[argv.index("--agent") + 1])
+        g["load"] = lambda: {"mcp_kinds": {"sm": []}, "accounts": accts}
+        assert "no secondary account" in brief("look up a customer", "search", None, None, None, str(cfg), ["sm"])
+        g["load"] = lambda: {"claude_only_mcp": ["sm"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]}
         assert brief("look up a customer", "search", None, None, None, str(cfg), ["sm"]).startswith("Done by") and envs[-1][0] == "claude"
         argv = envs[-1][2]
         assert "--mcp-config" in argv and "mcp__sm" in argv[argv.index("--allowedTools") + 1] and "mcp__p" not in argv[argv.index("--allowedTools") + 1]
