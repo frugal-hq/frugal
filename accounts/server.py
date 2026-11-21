@@ -575,8 +575,17 @@ def touched(cwd):
     return files
 
 
+def name(i):
+    """The name Frugal Deck shows for an account (renaming there sets it); the id where none is set."""
+    try:
+        label = json.loads((HOME / ".frugal-deck" / "settings.json").read_text(encoding="utf-8"))["labels"][i]
+        return label.strip() if isinstance(label, str) and label.strip() else i
+    except (OSError, ValueError, KeyError, TypeError):
+        return i
+
+
 def relogin(ids):
-    return "".join(f"frugal: secondary account {i} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
+    return "".join(f"frugal: secondary account {name(i)} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
 
 
 def failed_try(job, a, model, code, began, reason):
@@ -686,7 +695,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                         x["day"] = today()
             save(data)
         notice = relogin(relog)
-        label = f"{a['id']} ({', '.join(filter(None, [model, f'{eff} effort']))})"
+        label = f"{name(a['id'])} ({', '.join(filter(None, [model, f'{eff} effort']))})"
         if code != 0 or not out:
             failure = (err or out or f"exit {code}")[-400:]
             failed_try(job, a, model, code, began, failure)
