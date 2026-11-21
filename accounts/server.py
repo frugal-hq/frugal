@@ -95,7 +95,7 @@ def file_lock():
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL)
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):  # Windows: PermissionError while another process deletes the lock
             try:
                 if time.time() - path.stat().st_mtime > 10:
                     path.unlink()  # left by a killed process
