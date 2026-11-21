@@ -1,7 +1,11 @@
 #!/bin/sh
 # Token usage of a Claude Code session, summed from its transcript. Main thread only: subagents keep their own transcripts.
 # Usage: sh usage.sh [transcript.jsonl]   (default: the most recently written transcript, i.e. the current session)
-f=${1:-$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -1)}
+# Look in this folder's project dir first: a config dir can hold thousands of transcripts, and sorting them all hung for minutes.
+d=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
+p=$( (cygpath -w "$PWD" 2>/dev/null || pwd) | sed 's/[^A-Za-z0-9]/-/g')
+f=${1:-$(ls -t "$d/$p"/*.jsonl 2>/dev/null | head -1)}
+f=${f:-$(ls -t "$d"/*/*.jsonl 2>/dev/null | head -1)}
 [ -f "$f" ] || { echo "Usage: unavailable (no transcript found)"; exit 1; }
 # A response streams as several lines sharing one msg id; keep the last line per id.
 grep '"type":"assistant"' "$f" | awk '
