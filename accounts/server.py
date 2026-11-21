@@ -976,7 +976,7 @@ def reads_only(cmd):
     """True when each command of a chain or pipeline only reads (cat, grep, ls, git log), with no redirect into a file."""
     if "<<" in cmd or "`" in cmd or "$(" in cmd:
         return False
-    s = re.sub(r"\d?>\s*(/dev/null|&\d|\$null)", "", cmd)
+    s = re.sub(r"\d?>\s*(/dev/null|&\d|\$null)", "", QUOTED.sub('""', cmd))  # a quoted | or > is a pattern, not a pipe
     if ">" in s or re.search(r"\bsed\b[^|;&]*\s(-i|--in-place)", s) or re.search(r"\bfind\b[^|;&]*\s-(delete|exec|ok)", s):
         return False
     parts = [re.sub(r"^([A-Za-z_]\w*=\S*\s+)+", "", p.strip()) for p in re.split(r"&&|\|\||;|\|", s)]
@@ -1305,6 +1305,7 @@ def selftest():
     prune()
     assert not old.exists()
     assert reads_only("cat a.py | grep -n x") and reads_only("cd src && git log --oneline -3 2>/dev/null") and reads_only("Get-Content f; ls")
+    assert reads_only('grep -n "a\\|b" f | head') and not reads_only("grep x f > 'o.txt'")
     a, e = mcp_for("codex", {"p y": {"url": "https://p/", "headers": {"Authorization": "Bearer t"}}, "sm": {"command": "a", "env": {"K": "v"}}}, {"p y": ["get"], "sm": ["q"]})
     assert a == ["-c", 'mcp_servers.p_y.url="https://p/"', "-c", 'mcp_servers.p_y.env_http_headers={"Authorization" = "FRUGAL_MCP_0_0"}', "-c", 'mcp_servers.p_y.enabled_tools=["get"]',
                  "-c", 'mcp_servers.sm.command="a"', "-c", "mcp_servers.sm.args=[]", "-c", 'mcp_servers.sm.env_vars=["K"]', "-c", 'mcp_servers.sm.enabled_tools=["q"]'] and e == {"FRUGAL_MCP_0_0": "Bearer t", "K": "v"}
