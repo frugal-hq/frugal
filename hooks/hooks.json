@@ -19,6 +19,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/code-read.sh\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "Bash|PowerShell|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Agent|mcp__plugin_frugal_accounts__delegate",
         "hooks": [
           {
