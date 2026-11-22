@@ -134,7 +134,8 @@ def own(a):
 def session_mcp(cwd):
     """This session's MCP servers, user scope plus the project's. A delegate gets only the ones a task names; Grok never,
     and Codex or OpenCode never a server in claude_only_mcp: which agents may reach a server's data is each project's rule.
-    In a Frugal Deck chat, FRUGAL_DECK_MCP holds the chat's resolved set: the account's servers its allow and deny lists pass, plus the Deck's."""
+    In a Frugal Deck chat, FRUGAL_DECK_MCP holds the chat's resolved set: the account's servers its allow and deny lists pass, plus the Deck's,
+    plus the ones on its delegateOnly list, which the chat itself never loads."""
     folder = os.environ.get("CLAUDE_CONFIG_DIR")
     try:
         data = json.loads((Path(folder) / ".claude.json" if folder else HOME / ".claude.json").read_text(encoding="utf-8"))
@@ -153,10 +154,20 @@ def session_mcp(cwd):
     def entries(name, conf):  # the forms Claude Code's allowedMcpServers and deniedMcpServers match a server by
         target = {"serverUrl": conf["url"]} if conf.get("url") else {"serverCommand": [conf.get("command"), *(conf.get("args") or [])]}
         return {"serverName": name}, target
-    allowed, denied = deck.get("allowed") or [], deck.get("denied") or []
-    servers = {n: c for n, c in servers.items() if any(e in allowed for e in entries(n, c)) and not any(e in denied for e in entries(n, c))}
+    allowed, denied, only = deck.get("allowed") or [], deck.get("denied") or [], deck_only()
+    servers = {n: c for n, c in servers.items()
+               if n in only or any(e in allowed for e in entries(n, c)) and not any(e in denied for e in entries(n, c))}
     servers.update(deck.get("mcpServers") or {})
     return servers
+
+
+def deck_only():
+    """The servers a Frugal Deck chat leaves to delegates: not loaded in the chat, so their tools cost it no context."""
+    try:
+        deck = json.loads(os.environ.get("FRUGAL_DECK_MCP") or "null")
+    except ValueError:
+        return []
+    return [n for n in (deck.get("delegateOnly") or []) if isinstance(n, str)] if isinstance(deck, dict) else []
 
 
 def with_auth(servers, now=None):
@@ -939,8 +950,10 @@ def rule(event):
     DIR.mkdir(exist_ok=True)
     state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "edits": 0, "delegated": 0, "agent": False}), encoding="utf-8")
     if first:
+        only = deck_only()
         return (f"frugal: secondary accounts are set up. Delegate every bounded task with {TOOL}, level per task; "
-                "keep here only design, judgment calls and the final check.")
+                "keep here only design, judgment calls and the final check."
+                + (f" MCP servers for delegates only, not loaded here: {', '.join(only)}; name one in mcp when a task needs it." if only else ""))
     return nudge(s.get("reads", 0), s.get("delegated", 0))
 
 
@@ -1436,6 +1449,9 @@ def selftest():
         os.environ["FRUGAL_DECK_MCP"] = json.dumps({"mcpServers": {"d": {"type": "http", "url": "https://d/"}},
                                                     "allowed": [{"serverName": "sm"}, {"serverCommand": ["b"]}], "denied": [{"serverName": "p"}]})
         assert set(session_mcp(str(cfg))) == {"sm", "d"}
+        # a server the chat leaves to delegates reaches them though the chat denies it
+        os.environ["FRUGAL_DECK_MCP"] = json.dumps({"allowed": [{"serverName": "sm"}], "denied": [{"serverName": "p"}], "delegateOnly": ["p"]})
+        assert set(session_mcp(str(cfg))) == {"sm", "p"} and deck_only() == ["p"]
         del os.environ["FRUGAL_DECK_MCP"]
         (cfg / ".credentials.json").write_text(json.dumps({"mcpOAuth": {
             "py|1": {"serverName": "py", "serverUrl": "https://p/", "accessToken": "tok", "refreshToken": "REFRESH", "expiresAt": 2000_000},
