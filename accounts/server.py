@@ -266,7 +266,7 @@ def mcp_rule(server, tool=None):
     return "mcp__" + "__".join(re.sub(r"[^A-Za-z0-9_-]", "_", x) for x in (server, tool) if x)
 
 
-def list_tools(conf):
+def list_tools(conf, cwd=None):
     """An MCP server's tools, over streamable HTTP or from a stdio server started for the purpose, or None when they cannot be listed."""
     import queue, urllib.request
     # Cloudflare's browser check (error 1010) refuses urllib's default Python-urllib agent.
@@ -292,7 +292,7 @@ def list_tools(conf):
         if not conf.get("url"):
             proc = subprocess.Popen([shutil.which(conf["command"]) or conf["command"], *(conf.get("args") or [])], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={**os.environ, **(conf.get("env") or {})},
-                                    text=True, encoding="utf-8", start_new_session=os.name != "nt")
+                                    text=True, encoding="utf-8", cwd=cwd, start_new_session=os.name != "nt")
             threading.Thread(target=lambda: [lines.put(x) for x in proc.stdout], daemon=True).start()
         call({"jsonrpc": "2.0", "id": 1, "method": "initialize",
               "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "frugal", "version": "1"}}})
@@ -325,14 +325,14 @@ def cached_tools(name, tools=None):
         return tools
 
 
-def mcp_rules(servers):
+def mcp_rules(servers, cwd=None):
     """A delegate gets only the tools a server marks readOnlyHint and is denied the rest: it can read a ticket, never answer one.
     Returns (allowed, denied, servers whose tools could not be listed, {server: its read-only tool names})."""
     allow, deny, failed, ro = [], [], [], {}
     for name, conf in servers.items():
-        tools = list_tools(conf)
+        tools = list_tools(conf, cwd)
         if tools is None:
-            tools = list_tools(conf)  # a server still connecting often answers the second time
+            tools = list_tools(conf, cwd)  # a server still connecting often answers the second time
         tools = cached_tools(name) if tools is None else cached_tools(name, tools)
         if tools is None:
             failed.append(name)
@@ -721,7 +721,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     servers, expired = with_auth({n: found[n] for n in mcp})
     if expired:
         return f"frugal: this session's login to {', '.join(expired)} expired; call one of its tools here once to refresh it, then delegate again."
-    allow, deny, failed, ro = mcp_rules(servers)
+    allow, deny, failed, ro = mcp_rules(servers, cwd)
     if failed:
         return f"frugal: could not list the tools of {', '.join(failed)} to keep the delegate read-only. Do it here."
     if level not in LEVELS and kind == "edit" and len(text) > 2500:
@@ -1588,7 +1588,7 @@ def selftest():
             try:
                 g.update(load=lambda: {"accounts": [{"id": "gem", "kind": "gemini", "paid": True}]},
                          session_mcp=lambda cwd: {"test": {}}, with_auth=lambda servers: (servers, []),
-                         mcp_rules=lambda servers: ([], [], [], {}))
+                         mcp_rules=lambda servers, cwd=None: ([], [], [], {}))
                 assert brief("look", "search", None, None, None, ".", ["test"]) == "Gemini delegates do not take MCP servers yet."
             finally:
                 g.update(mcp_real)
@@ -1756,6 +1756,8 @@ def selftest():
     real_list_tools = list_tools
     assert list_tools({"command": sys.executable, "args": ["-c", 'import json, os, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if m.get("method") == "tools/list":\n        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"tools": [{"name": os.environ["T"]}]}}), flush=True)\n    elif "id" in m:\n        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {}}), flush=True)\n'], "env": {"T": "get_y"}}) == [{"name": "get_y"}]
     assert list_tools({"command": "frugal-no-such-command"}) is None
+    with tempfile.TemporaryDirectory() as folder:
+        assert list_tools({"command": sys.executable, "args": ["-c", 'import json, os, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n    if "id" in m:\n        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"tools": [{"name": os.getcwd()}]}}), flush=True)\n']}, folder) == [{"name": folder}]
     g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (prompts.append(prompt), (0, "PASS: all green", ""))[1],
              load=lambda: {"accounts": [{"id": "stub", "kind": "claude"}]}, save=lambda data: None)
     envs = []
@@ -1815,7 +1817,7 @@ def selftest():
                             "own": {"url": "https://p/", "headers": {"authorization": "x"}}}, now=1000)
         assert s["py"]["headers"] == {"Authorization": "Bearer tok"} and "REFRESH" not in json.dumps(s) and exp == ["old"]
         assert s["sm"] == {"command": "a"} and s["own"]["headers"] == {"authorization": "x"}
-        g["list_tools"] = lambda conf: None if "bad" in conf.get("url", "") else [{"name": "get_x", "annotations": {"readOnlyHint": True}}, {"name": "send_x"}]
+        g["list_tools"] = lambda conf, cwd=None: None if "bad" in conf.get("url", "") else [{"name": "get_x", "annotations": {"readOnlyHint": True}}, {"name": "send_x"}]
         assert mcp_rules({"py": {"url": "https://p/"}, "sm": {"command": "a"}, "b": {"url": "https://bad/"}}) == (["mcp__py__get_x", "mcp__sm__get_x"], ["mcp__py__send_x", "mcp__sm__send_x"], ["b"], {"py": ["get_x"], "sm": ["get_x"]})
         g["list_tools"] = real_list_tools
         (cfg / "mcp-needs-auth-cache.json").write_text(json.dumps({"py": {}, "x": {}}), encoding="utf-8")
