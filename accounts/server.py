@@ -1245,7 +1245,12 @@ def child_env(a, extra=None):
     # The main account uses the default folder, so its delegate drops the CLAUDE_CONFIG_DIR this session may run with.
     env = {**os.environ, **(extra or {}), **account_env(a)}
     if a.get("kind") == "gemini":
-        env.pop("GEMINI_API_KEY", None)  # use this account's .env, never the parent's key
+        env.pop("GEMINI_API_KEY", None)  # never use the parent's key
+        try:
+            if key := re.search(r"^GEMINI_API_KEY=(.+)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M):
+                env["GEMINI_API_KEY"] = key[1]
+        except (OSError, ValueError):
+            pass
     if env.get("CLAUDE_CONFIG_DIR") and same(env["CLAUDE_CONFIG_DIR"]) == same(HOME / ".claude"):
         del env["CLAUDE_CONFIG_DIR"]
     return env
@@ -1491,16 +1496,17 @@ def selftest():
             for kind in ("search", "note", "edit", "run"):
                 assert argv_for(gemini, kind, "auto", None) == ["gemini", "-p", "Follow the brief on stdin.", "-o", "json", "--approval-mode",
                                                                 "plan" if kind in ("search", "note") else "yolo", "-m", "auto"]
-            sys.stdin = io.StringIO("test-key\nignored-second-line\n")
+            sys.stdin = io.StringIO("k1\nignored-second-line\n")
             assert "free tier" in cli(["add", "gemini", "gem"])
             gemini = load()["accounts"][0]
             key_file = DIR / "gemini-gem" / ".gemini" / ".env"
-            assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=test-key\n" and logged_in(gemini) == (True, None)
+            assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=k1\n" and logged_in(gemini) == (True, None)
             if os.name != "nt":
                 assert key_file.stat().st_mode & 0o777 == 0o600
             assert account_env(gemini) == {"GEMINI_CLI_HOME": str(DIR / "gemini-gem")}
-            os.environ["GEMINI_API_KEY"] = "parent-test-key"
-            assert "GEMINI_API_KEY" not in child_env(gemini)
+            os.environ["GEMINI_API_KEY"] = "k0"
+            assert child_env(gemini)["GEMINI_API_KEY"] == "k1"
+            assert "GEMINI_API_KEY" not in child_env({**gemini, "home": str(DIR / "missing")})
             assert blocked(gemini, {}) and not blocked(gemini, {"opencode_allow_training": True})
             assert json.loads(cli(["status", "gem"])) == {"id": "gem", "kind": "gemini", "installed": True, "loggedIn": True}
             assert json.loads(cli(["login-command", "gem"])) == {"argv": None, "env": account_env(gemini)}
