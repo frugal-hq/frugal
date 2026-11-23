@@ -421,7 +421,10 @@ def order(accounts, busy, level=None):
     pool = ready(accounts)
     if level in ("heavy", "max"):
         pool = [a for a in pool if a["kind"] in STRONG]
-    rank = (lambda a: STRONG[a["kind"]]) if level in ("heavy", "max") else (lambda a: 0)
+    # jobs.jsonl 2026-11-08..22: Grok averaged ~375k tokens per search against ~44k for Codex and ~130k for OpenCode,
+    # and was the only paid delegate ($18.36 in 43 jobs).
+    # frugal: rank by measured tokens per kind from jobs.jsonl when more kinds are paid.
+    rank = (lambda a: STRONG[a["kind"]]) if level in ("heavy", "max") else (lambda a: a.get("kind") == "grok")
     return sorted(pool, key=lambda a: (rank(a), busy.get(a["id"], 0) * 1000 + (a.get("used", 0) if a.get("day") == day else 0)))
 
 
@@ -1476,6 +1479,8 @@ def selftest():
     assert [a["id"] for a in order(pool, {"old": 1})] == ["b", "a", "old"]
     mixed = [{"id": "o", "kind": "opencode"}, {"id": "g", "kind": "grok"}, {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude", "used": 9, "day": today()}]
     assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["c", "x", "g"] and order(mixed, {}, "standard")[0]["id"] == "o"
+    mixed = [{"id": "g", "kind": "grok", "used": 0, "day": today()}, {"id": "x", "kind": "codex", "used": 5, "day": today()}]
+    assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "x"
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
     assert argv_for(codex, "run", None, "low")[-3:] == ["-s", "workspace-write", "-"]
     assert argv_for(claude, "note", "sonnet", "medium")[-3:] == ["--tools", "", "--strict-mcp-config"]
