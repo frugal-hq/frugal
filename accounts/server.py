@@ -400,7 +400,8 @@ def choose(a, kind, level=None, effort=None):
     # A Codex model the login does not list falls back to the one in its config.toml.
     if a["kind"] == "codex":
         models = codex_models(a) or a.get("models") or []
-        model = next((slug for slug in models if re.fullmatch(rf"gpt-[\d.]+-{model}", slug)), None)
+        model = max((slug for slug in models if re.fullmatch(rf"gpt-[\d.]+-{model}", slug)),
+                    key=lambda slug: tuple(map(int, slug.split("-")[1].split("."))), default=None)
     if a["kind"] == "gemini":
         model = next((slug for slug in gemini_models() if re.fullmatch(rf"gemini-[\d.]+-{model}", slug)), "auto") if model != "pro" else "auto"
     if a["kind"] == "opencode":
@@ -1435,6 +1436,8 @@ def selftest():
         assert choose(codex, "search", "light") == ("gpt-6-luna", "low")
         assert choose(codex, "edit", "standard") == ("gpt-6.2-sol", "medium")
         assert choose(codex, "edit", "max") == ("gpt-6.2-astra", "xhigh")
+        globals()["codex_models"] = lambda a=None: ["gpt-6.1-sol", "gpt-6.2-sol"]
+        assert choose(codex, "edit", "standard") == ("gpt-6.2-sol", "medium")
         globals()["codex_models"] = lambda a=None: []
         assert choose({"id": "x", "kind": "codex", "models": []}, "edit", "standard") == (None, "medium")
     finally:
