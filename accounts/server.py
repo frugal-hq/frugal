@@ -509,7 +509,9 @@ TL = threading.local()  # .req: the Request this thread works for; unset in hook
 
 def kill_tree(p):
     if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdin=subprocess.DEVNULL, capture_output=True)
+        r = subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], stdin=subprocess.DEVNULL, capture_output=True)
+        if r.returncode and p.poll() is None:
+            p.kill()  # a sandbox may deny taskkill; the owned process handle can still be terminated
     else:
         try:
             os.killpg(p.pid, signal.SIGKILL)
