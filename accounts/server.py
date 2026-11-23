@@ -26,10 +26,10 @@ RULES = {
     "claude": {"efforts": ["low", "medium", "high", "xhigh", "max"],
                "levels": {"light": ("haiku", "low"), "standard": ("sonnet", "medium"), "heavy": ("opus", "high"), "max": ("opus", "max")}},
     "codex": {"efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
-              "levels": {"light": ("gpt-6-luna", "low"), "standard": ("gpt-6.1-sol", "medium"), "heavy": ("gpt-6.1-sol", "high"), "max": ("gpt-6-astra", "xhigh")}},
-    # grok-4.6 rejects minimal and max ("use one of: xhigh, high, medium, low") yet still exits 0.
+              "levels": {"light": ("luna", "low"), "standard": ("sol", "medium"), "heavy": ("sol", "high"), "max": ("astra", "xhigh")}},
+    # grok uses the CLI default model; it takes low, medium, high, xhigh (rejects minimal and max yet still exits 0).
     "grok": {"efforts": ["low", "medium", "high", "xhigh"],
-             "levels": {"light": ("grok-4.6", "low"), "standard": ("grok-4.6", "medium"), "heavy": ("grok-4.6", "high"), "max": ("grok-4.6", "xhigh")}},
+             "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "xhigh")}},
     # OpenCode runs the one model its account names; --variant is per provider, and one a model lacks is ignored.
     "opencode": {"efforts": ["low", "medium", "high"],
                  "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "high")}},
@@ -331,14 +331,15 @@ def choose(a, kind, level=None, effort=None):
     rule = RULES[a["kind"]]
     model, base = rule["levels"][level if level in LEVELS else DEFAULT_LEVEL.get(kind, "light")]
     # A Codex model the login does not list falls back to the one in its config.toml.
-    if a["kind"] == "codex" and model not in (a.get("models") or []):
-        model = None
+    if a["kind"] == "codex":
+        models = codex_models() or a.get("models") or []
+        model = next((slug for slug in models if re.fullmatch(rf"gpt-[\d.]+-{model}", slug)), None)
     if a["kind"] == "opencode":
         model = a["model"]
     return model, fit(effort or base, rule["efforts"])
 
 
-STRONG = {"claude": 0, "codex": 1, "grok": 2}  # heavy and max: Claude secondaries, then GPT-6.1 Sol, then Grok 4.6; free OpenCode models never
+STRONG = {"claude": 0, "codex": 1, "grok": 2}  # heavy and max: Claude, Codex, Grok; free OpenCode models never
 
 
 def order(accounts, busy, level=None):
@@ -387,7 +388,7 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mc
         tools = ["--tools", "read_file,grep,list_dir,run_terminal_cmd"] if kind == "search" else []
         # MCP servers come in an agent file; deny rules (server__tool) block the tools that are not read-only, even under --always-approve.
         tools += (["--agent", mcp_file] if mcp_file else []) + [x for r in mcp_deny for x in ("--deny", f"MCPTool({r[5:]})")]
-        return ["grok", "--no-auto-update", "-m", model, "--effort", effort, "--always-approve", "--output-format", "json", *tools]
+        return ["grok", "--no-auto-update", *(["-m", model] if model else []), "--effort", effort, "--always-approve", "--output-format", "json", *tools]
     if a["kind"] == "opencode":
         # --auto approves what is not denied; the plan agent denies edits, so search stays read-only (tested on opencode 1.19.5)
         return ["opencode", "run", "-m", model, "--variant", effort, "--agent", "plan" if kind == "search" else "build", "--auto", "--format", "json"]
@@ -1258,8 +1259,16 @@ def selftest():
     assert choose(claude, "search") == ("sonnet", "medium")
     assert choose(claude, "edit", "heavy") == ("opus", "high")
     assert choose(claude, "search", effort="minimal") == ("sonnet", "low")
-    assert choose(codex, "search", "light") == ("gpt-6-luna", "low")
-    assert choose(codex, "edit", "max") == (None, "xhigh")
+    saved_codex_models = globals()["codex_models"]
+    try:
+        globals()["codex_models"] = lambda a=None: ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-luna"]
+        assert choose(codex, "search", "light") == ("gpt-6-luna", "low")
+        assert choose(codex, "edit", "standard") == ("gpt-6.2-sol", "medium")
+        assert choose(codex, "edit", "max") == ("gpt-6.2-astra", "xhigh")
+        globals()["codex_models"] = lambda a=None: []
+        assert choose({"id": "x", "kind": "codex", "models": []}, "edit", "standard") == (None, "medium")
+    finally:
+        globals()["codex_models"] = saved_codex_models
     now = time.time()
     pool = [{"id": "a", "used": 5, "day": today()}, {"id": "b", "used": 1, "day": today()}, {"id": "off", "enabled": False},
             {"id": "lim", "exhausted_until": now + 60}, {"id": "old", "used": 9, "day": "2000-01-01"}]
@@ -1283,10 +1292,11 @@ def selftest():
     assert argv_for(codex, "run", None, "low")[-3:] == ["-s", "workspace-write", "-"]
     assert argv_for(claude, "note", "sonnet", "medium")[-3:] == ["--tools", "", "--strict-mcp-config"]
     grok = {"id": "g", "kind": "grok"}
-    assert choose(grok, "edit", "heavy") == ("grok-4.6", "high")
-    assert "--always-approve" in argv_for(grok, "edit", "grok-4.6", "high") and "--tools" not in argv_for(grok, "edit", "grok-4.6", "high")
-    assert argv_for(grok, "search", "grok-4.6", "low")[-2:] == ["--tools", "read_file,grep,list_dir,run_terminal_cmd"]
-    assert argv_for(grok, "search", "grok-4.6", "low", (), "a.md", (), ["mcp__py__send_x"])[-4:] == ["--agent", "a.md", "--deny", "MCPTool(py__send_x)"]
+    assert choose(grok, "edit", "heavy") == (None, "high")
+    assert "--always-approve" in argv_for(grok, "edit", None, "high") and "--tools" not in argv_for(grok, "edit", None, "high")
+    assert "--model" not in argv_for(grok, "edit", None, "high")
+    assert argv_for(grok, "search", None, "low")[-2:] == ["--tools", "read_file,grep,list_dir,run_terminal_cmd"]
+    assert argv_for(grok, "search", None, "low", (), "a.md", (), ["mcp__py__send_x"])[-4:] == ["--agent", "a.md", "--deny", "MCPTool(py__send_x)"]
     assert AUTH.search("Error: Not signed in. To authenticate")
     oc = {"id": "o", "kind": "opencode", "model": "opencode/glm-5.3-flash-free", "data_dir": "/d"}
     assert choose(oc, "search", "max") == ("opencode/glm-5.3-flash-free", "high") and account_env(oc) == {"XDG_DATA_HOME": "/d"}
