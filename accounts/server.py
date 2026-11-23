@@ -237,14 +237,18 @@ def with_auth(servers, now=None):
                 data = json.loads(path.read_text(encoding="utf-8"))  # keep other keys changed during the HTTP call
                 current = data["mcpOAuth"][key]
                 if any(current.get(k) != t.get(k) for k in ("serverName", "serverUrl", "accessToken", "refreshToken")):
-                    raise ValueError("Login changed during refresh")
-                current.update(updates)
-                if "expires_in" not in result:
-                    current.pop("expiresAt", None)
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
-                    tmp = Path(f.name)
-                    json.dump(data, f, indent=2)
-                os.replace(tmp, path)
+                    if not (current.get("serverName") == t.get("serverName") and current.get("serverUrl") == t.get("serverUrl")
+                            and current.get("accessToken") and current["accessToken"] != t["accessToken"]
+                            and (current.get("expiresAt") is None or current["expiresAt"] / 1000 > now + 300)):
+                        raise ValueError("Login changed during refresh")
+                else:
+                    current.update(updates)
+                    if "expires_in" not in result:
+                        current.pop("expiresAt", None)
+                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+                        tmp = Path(f.name)
+                        json.dump(data, f, indent=2)
+                    os.replace(tmp, path)
                 t = current
             except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
                 expired.append(name)
@@ -1651,6 +1655,22 @@ def selftest():
             stored = json.loads(credentials.read_text(encoding="utf-8"))
             assert stored["mcpOAuth"]["stale"] == stale and stored["other"] == {"keep": True}
             assert stored["mcpOAuth"]["current"] == {**entry, "accessToken": "new", "expiresAt": 4600_000, "refreshToken": "r2", "scope": "read"}
+            for changes, usable in (({"accessToken": "elsewhere", "expiresAt": None}, True),
+                                    ({"accessToken": "elsewhere", "expiresAt": 4600_000}, True),
+                                    ({"accessToken": "elsewhere", "expiresAt": 1300_000}, False),
+                                    ({"refreshToken": "elsewhere"}, False),
+                                    ({"accessToken": "elsewhere", "serverName": "other", "expiresAt": None}, False),
+                                    ({"accessToken": "elsewhere", "serverUrl": "https://other/", "expiresAt": None}, False),
+                                    ({"accessToken": "", "expiresAt": None}, False)):
+                credentials.write_text(json.dumps(data), encoding="utf-8")
+                def refreshed_elsewhere(t):
+                    latest = {"mcpOAuth": {"stale": stale, "current": {**entry, **changes}}}
+                    credentials.write_text(json.dumps(latest), encoding="utf-8")
+                    return {"access_token": "unused", "expires_in": 3600}
+                globals()["refresh_token"] = refreshed_elsewhere
+                servers, expired = with_auth({"pylon": {"url": "https://p/"}}, now=1000)
+                assert (servers, expired) == ({"pylon": {"url": "https://p/", "headers": {"Authorization": "Bearer elsewhere"}}}, []) if usable else (servers, expired) == ({}, ["pylon"])
+                assert json.loads(credentials.read_text(encoding="utf-8"))["mcpOAuth"]["current"] == {**entry, **changes}
             credentials.write_text(json.dumps(data), encoding="utf-8")
             globals()["refresh_token"] = lambda t: None
             assert with_auth({"pylon": {"url": "https://p/"}}, now=1000) == ({}, ["pylon"])
