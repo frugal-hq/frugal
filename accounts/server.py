@@ -1363,6 +1363,10 @@ def cli(args):
             r = subprocess.run([npm, "install", "-g", PACKAGES[kind]], stdin=subprocess.DEVNULL)
             if r.returncode:
                 raise SystemExit(r.returncode)
+            data = load()
+            existing = next((a for a in data["accounts"] if a["id"] == aid), None)
+            if existing and not (kind == existing["kind"] == "gemini"):
+                raise SystemExit(f"{aid} is already set up.")
         a = {"id": aid, "kind": kind, "enabled": True, "used": 0, "day": ""}
         if kind == "claude":
             a["config_dir"] = str(HOME / f".claude-{aid}")
@@ -1549,11 +1553,25 @@ def selftest():
                 assert str(e) == "Install Node.js (https://nodejs.org) first, then try again."
             shutil.which = lambda name: "npm.cmd" if name == "npm" else None
             installs = []
-            subprocess.run = lambda argv, **kw: (installs.append((argv, kw)), subprocess.CompletedProcess(argv, 0))[1]
+            concurrent = {"id": "other", "kind": "codex", "used": 7, "exhausted_until": 123, "needs_login": True}
+            def install(argv, **kw):
+                installs.append((argv, kw))
+                save({"accounts": [concurrent]})
+                return subprocess.CompletedProcess(argv, 0)
+            subprocess.run = install
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 cli(["add", "grok", "install"])
             assert output.getvalue() == "Installing @xai-official/grok...\n"
             assert installs == [(["npm.cmd", "install", "-g", "@xai-official/grok"], {"stdin": subprocess.DEVNULL})]
+            assert load()["accounts"] == [concurrent, PENDING[-1]]
+            concurrent = {"id": "taken", "kind": "grok"}
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    cli(["add", "grok", "taken"])
+                    raise AssertionError("Concurrent account overwritten")
+                except SystemExit as e:
+                    assert str(e) == "taken is already set up."
+            assert load()["accounts"] == [concurrent]
             job = {}
             assert cli_reply("gemini", '{"response":"done","stats":{"models":{"flash":{"tokens":{"total":12}}}}}', "", job) == ("done", "")
             assert job == {"tokens": 12}
