@@ -463,6 +463,23 @@ def blocked(a, data):
             and not data.get("opencode_allow_training", False))
 
 
+def why_none(data, servers, level, now=None):
+    # Why no account was even tried: "no secondary account finished this" read as if one had failed.
+    now = time.time() if now is None else now
+    only, kinds = data.get("claude_only_mcp", []), data.get("mcp_kinds", {})
+    rules = [f"{n} goes only to {', '.join(['claude'] if n in only else kinds[n])} accounts" for n in servers if n in only or n in kinds]
+    states = []
+    for a in data["accounts"]:
+        if own(a) or servers and a["kind"] == "gemini" or any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers):
+            continue
+        state = ("off" if not a.get("enabled", True) else "logged out" if a.get("needs_login")
+                 else f"at its limit until {time.strftime('%H:%M', time.localtime(a['exhausted_until']))}" if a.get("exhausted_until", 0) > now
+                 else "blocked" if blocked(a, data) else "too light for heavy work" if level in ("heavy", "max") and a["kind"] not in STRONG else "")
+        if state:
+            states.append(f"{name(a['id'])} {state}")
+    return "; ".join(rules + (states or ["no account of those kinds"] if rules else states))
+
+
 def training_message(a):
     return ("its key is on the free tier and may train on your data (opencode-training on; re-add with --paid if billing is on)"
             if a["kind"] == "gemini" else "its model may train on your data (opencode-training on)")
@@ -867,6 +884,9 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
     # Work a failed try left in the tree: without the list, the chat redid files that already existed.
     left = sorted(f for f, t in touched(cwd).items() if start.get(f) != t) if kind == "edit" else []
     changed = f" Changed, untested: {', '.join(left[:30])}; review that diff here before redoing any of it." if left else ""
+    if not tried:
+        why = why_none(load(), servers, level)
+        return f"frugal: no secondary account can take this{f' ({why})' if why else ''}. Do it here."
     return f"{relogin(relog)}frugal: no secondary account finished this{f' ({failure})' if failure else ''}.{changed} Do it here."
 
 
@@ -1809,6 +1829,10 @@ def selftest():
         r = brief("look", "search", None, None, None, ".", job=job)
         assert r.endswith("found it") and job["cost"] == 0.25 and job["account"] == "stub" and outcome(r, job) == "done", (r, job)
         assert outcome("frugal: no secondary account finished this. Do it here.", {}) == "not delegated"
+        none = {"mcp_kinds": {"pylon": ["claude"]}, "accounts": [{"id": "sm", "kind": "claude", "exhausted_until": 2e9}, {"id": "cx", "kind": "codex"}]}
+        w = why_none(none, ["pylon"], None, now=1e9)
+        assert w.startswith("pylon goes only to claude accounts; sm at its limit until ") and "cx" not in w, w
+        assert why_none({"accounts": []}, ["pylon"], None) == "" and why_none({"mcp_kinds": {"x": ["grok"]}, "accounts": []}, ["x"], None) == "x goes only to grok accounts; no account of those kinds"
         assert job["level"] == "standard" and job["tokens"] == 0, job
         # a long edit brief runs on heavy; a timed-out edit returns the files it changed, not the ones already dirty
         with tempfile.TemporaryDirectory() as repo:
