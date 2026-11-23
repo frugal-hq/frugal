@@ -395,7 +395,7 @@ def choose(a, kind, level=None, effort=None):
     model, base = rule["levels"][level if level in LEVELS else DEFAULT_LEVEL.get(kind, "light")]
     # A Codex model the login does not list falls back to the one in its config.toml.
     if a["kind"] == "codex":
-        models = codex_models() or a.get("models") or []
+        models = codex_models(a) or a.get("models") or []
         model = next((slug for slug in models if re.fullmatch(rf"gpt-[\d.]+-{model}", slug)), None)
     if a["kind"] == "opencode":
         model = a["model"]
@@ -414,17 +414,17 @@ def order(accounts, busy, level=None):
     return sorted(pool, key=lambda a: (rank(a), busy.get(a["id"], 0) * 1000 + (a.get("used", 0) if a.get("day") == day else 0)))
 
 
-def codex_models():
+def codex_models(a=None):
     try:
-        cache = json.loads((HOME / ".codex" / "models_cache.json").read_text(encoding="utf-8"))
+        cache = json.loads((Path(a["home"]) if a and a.get("home") else HOME / ".codex").joinpath("models_cache.json").read_text(encoding="utf-8"))
         return [m["slug"] for m in cache.get("models", []) if m.get("visibility") != "hide"]
     except (OSError, ValueError, KeyError):
         return []
 
 
-def codex_mcp():
+def codex_mcp(a=None):
     try:
-        return set(tomllib.loads((HOME / ".codex" / "config.toml").read_text(encoding="utf-8")).get("mcp_servers", {}))
+        return set(tomllib.loads((Path(a["home"]) if a and a.get("home") else HOME / ".codex").joinpath("config.toml").read_text(encoding="utf-8")).get("mcp_servers", {}))
     except (OSError, ValueError):
         return set()
 
@@ -727,7 +727,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             env = {k: v for k, v in env.items() if not any(n.upper() in k.upper() for n in only)}
         if a["kind"] == "grok":
             env.update(GROK_CLAUDE_MCPS_ENABLED="false", GROK_CLAUDE_HOOKS_ENABLED="false")  # grok loads Claude's MCP servers and hooks by default
-        off = [n for n in only if n in codex_mcp()] if a["kind"] == "codex" else []
+        off = [n for n in only if n in codex_mcp(a)] if a["kind"] == "codex" else []
         mcp_args, mcp_env = mcp_for(a["kind"], servers, ro) if servers and a["kind"] in ("codex", "opencode") else ([], {})
         env.update(mcp_env)
         mcp_file = None
@@ -1198,6 +1198,8 @@ def hook_stop(event):
 
 def account_env(a):
     # OpenCode keeps its login and sessions in its own data folder per account
+    if a.get("home"):
+        return {{"codex": "CODEX_HOME", "grok": "GROK_HOME"}[a["kind"]]: a["home"]}
     return {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {"XDG_DATA_HOME": a["data_dir"]} if a.get("data_dir") else {}
 
 
@@ -1226,7 +1228,7 @@ def logged_in(a):
     """(signed in, email or None). Grok and OpenCode keep their login in auth.json, which grok logout leaves as {}."""
     if a["kind"] in ("grok", "opencode"):
         auth = read_json(Path(a["data_dir"]) / "opencode" / "auth.json" if a["kind"] == "opencode"
-                         else Path(os.environ.get("GROK_HOME") or HOME / ".grok") / "auth.json")
+                         else Path(a.get("home") or os.environ.get("GROK_HOME") or HOME / ".grok") / "auth.json")
         return bool(auth), find_email(auth)
     cmd = ["codex", "login", "status"] if a["kind"] == "codex" else ["claude", "auth", "status"]
     exe = shutil.which(cmd[0])
@@ -1293,8 +1295,12 @@ def cli(args):
         a = {"id": aid, "kind": kind, "enabled": True, "used": 0, "day": ""}
         if kind == "claude":
             a["config_dir"] = str(HOME / f".claude-{aid}")
-        elif kind == "codex":
-            a["models"] = codex_models()
+        elif kind in ("codex", "grok"):
+            if any(x["kind"] == kind for x in data["accounts"]):
+                a["home"] = str(DIR / f"{kind}-{aid}")
+                Path(a["home"]).mkdir(parents=True, exist_ok=True)
+            if kind == "codex":
+                a["models"] = codex_models(a)
         elif kind == "opencode":
             a["model"], a["data_dir"] = args[3], str(DIR / f"opencode-{aid}")
             if blocked(a, data):
@@ -1383,6 +1389,19 @@ def selftest():
     try:
         with tempfile.TemporaryDirectory() as folder:
             g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[])
+            shutil.which = lambda name: name + ".cmd"
+            for kind in ("codex", "grok"):
+                cli(["add", kind, kind + "1"])
+                cli(["add", kind, kind + "2"])
+                first, second = [a for a in load()["accounts"] if a["kind"] == kind]
+                assert "home" not in first and second["home"] == str(DIR / (kind + "-" + kind + "2"))
+                assert account_env(second) == {kind.upper() + "_HOME": second["home"]}
+                if kind == "codex":
+                    (Path(second["home"]) / "models_cache.json").write_text('{"models":[{"slug":"gpt-6.2-sol"}]}', encoding="utf-8")
+                    assert codex_models(second) == ["gpt-6.2-sol"]
+                else:
+                    (Path(second["home"]) / "auth.json").write_text('{"token":"test-token"}', encoding="utf-8")
+                    assert logged_in(second) == (True, None)
             shutil.which = lambda name: None
             try:
                 cli(["add", "codex", "missing"])
