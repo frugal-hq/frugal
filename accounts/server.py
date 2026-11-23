@@ -816,6 +816,16 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                     elif code != 0 and LIMIT.search(out + err):
                         x["exhausted_until"] = time.time() + HOUR
                     else:
+                        # oc-beam failed 4 times with invalid_function_parameters and GLM/crouton models 8 times in two weeks,
+                        # each retried every task.
+                        if code != 0 and code != 124:
+                            x["errors"] = (x.get("errors", 0) if x.get("errors_day") == today() else 0) + 1
+                            x["errors_day"] = today()
+                            if x["errors"] >= 3:
+                                x["exhausted_until"] = time.time() + 6 * HOUR
+                                x["errors"] = 0
+                        elif code == 0:
+                            x["errors"] = 0
                         x["used"] = (x.get("used", 0) if x.get("day") == today() else 0) + 1
                         x["day"] = today()
             save(data)
@@ -1978,6 +1988,19 @@ def selftest():
         g["run_check"] = lambda check, cwd, timeout=300: (1, "selftest ok")
         r = brief("copy", "edit", "echo 'selftest ok'; test 1 = 2", "standard", None, ".")
         assert "check `echo 'selftest ok'; test 1 = 2` exited 1: selftest ok" in r and "no error in the output" in r, r
+        # Generic errors accumulate across tasks, reset each day and on success, and bench the account for six hours.
+        accounts[:] = [{"id": "c", "kind": "claude", "errors": 2, "errors_day": "2000-01-01"}]
+        g["load"] = lambda: {"accounts": accounts}
+        for code, errors in [(1, 1), (1, 2), (0, 0), (1, 1), (1, 2), (1, 0)]:
+            replies[:] = [(code, "ok" if code == 0 else "", "" if code == 0 else "invalid_function_parameters")]
+            began = time.time()
+            brief("look", "search", None, "standard", None, ".")
+            assert accounts[0]["errors"] == errors and accounts[0]["errors_day"] == today(), accounts
+            if code == 1 and errors == 0:
+                assert began + 6 * HOUR <= accounts[0]["exhausted_until"] <= time.time() + 6 * HOUR, accounts
+                assert not ready(accounts), accounts
+            else:
+                assert "exhausted_until" not in accounts[0], accounts
     finally:
         g.update(real)
     return "selftest ok"
