@@ -1937,7 +1937,14 @@ if __name__ == "__main__":
             elif note:
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}}))
     elif cmd[0] == "selftest":
-        print(selftest())
+        saved_paths = DIR, FILE, HEADS_UP, JOBS
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                DIR = Path(folder)
+                FILE, HEADS_UP, JOBS = DIR / "accounts.json", DIR / "heads-up.json", DIR / "jobs.jsonl"
+                print(selftest())
+        finally:
+            DIR, FILE, HEADS_UP, JOBS = saved_paths
     else:
         with file_lock():
             print(cli(cmd), flush=True)
