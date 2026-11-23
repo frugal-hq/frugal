@@ -34,6 +34,8 @@ RULES = {
     "opencode": {"efforts": ["low", "medium", "high"],
                  "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "high")}},
 }
+PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "grok": "@xai-official/grok",
+            "opencode": "opencode-ai", "gemini": "@google/gemini-cli"}
 DEFAULT_LEVEL = {"search": "standard", "run": "standard", "edit": "standard", "note": "light"}  # light (haiku, low) missed most of a 5-question lookup; pass level "light" only for trivial greps. A heads-up note is one judgment, which haiku makes as well as sonnet
 LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|quota|too many requests|\b429\b", re.I)
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
@@ -1280,6 +1282,14 @@ def cli(args):
         kind, aid = args[1], args[2]
         if any(a["id"] == aid for a in data["accounts"]):
             return f"{aid} is already set up."
+        if not shutil.which(kind):
+            npm = shutil.which("npm")
+            if not npm:
+                raise SystemExit("Install Node.js (https://nodejs.org) first, then try again.")
+            print(f"Installing {PACKAGES[kind]}...", flush=True)
+            r = subprocess.run([npm, "install", "-g", PACKAGES[kind]], stdin=subprocess.DEVNULL)
+            if r.returncode:
+                raise SystemExit(r.returncode)
         a = {"id": aid, "kind": kind, "enabled": True, "used": 0, "day": ""}
         if kind == "claude":
             a["config_dir"] = str(HOME / f".claude-{aid}")
@@ -1366,6 +1376,29 @@ def selftest():
     assert blocked(pickle, {}) and not blocked(pickle, {"opencode_allow_training": True}) and not blocked(oc, {})
     assert not blocked({"kind": "opencode", "model": "openrouter/nvidia/nemotron-x"}, {})
     assert argv_for(codex, "edit", None, "low", ["serviceminder"])[-5:-3] == ["-c", "mcp_servers.serviceminder.enabled=false"]
+    import io
+    g = globals()
+    real = {k: g[k] for k in ("DIR", "FILE", "PENDING")}
+    saved_which, saved_run, saved_stdin = shutil.which, subprocess.run, sys.stdin
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[])
+            shutil.which = lambda name: None
+            try:
+                cli(["add", "codex", "missing"])
+                raise AssertionError("Missing npm accepted")
+            except SystemExit as e:
+                assert str(e) == "Install Node.js (https://nodejs.org) first, then try again."
+            shutil.which = lambda name: "npm.cmd" if name == "npm" else None
+            installs = []
+            subprocess.run = lambda argv, **kw: (installs.append((argv, kw)), subprocess.CompletedProcess(argv, 0))[1]
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                cli(["add", "grok", "install"])
+            assert output.getvalue() == "Installing @xai-official/grok...\n"
+            assert installs == [(["npm.cmd", "install", "-g", "@xai-official/grok"], {"stdin": subprocess.DEVNULL})]
+    finally:
+        g.update(real)
+        shutil.which, subprocess.run, sys.stdin = saved_which, saved_run, saved_stdin
     tmp = DIR / "selftest-transcript.jsonl"
     DIR.mkdir(exist_ok=True)
     tmp.write_text("\n".join(json.dumps(e) for e in [
