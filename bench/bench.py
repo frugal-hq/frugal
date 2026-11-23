@@ -9,6 +9,8 @@ Conditions (caveman and ponytail at the level in %APPDATA%/<plugin>/config.json,
   F  caveman alone
   G  ponytail alone
   R  /frugal delegate (delegation module forced on)
+  N  /frugal with secondary accounts off (FRUGAL_DELEGATED=1 skips frugal's account hooks)
+  S  /frugal with secondary accounts on; the delegates' tokens and cost come from ~/.frugal/jobs.jsonl
   T  /frugal tight (experimental in 0.4, removed in 1.0; E is plain /frugal on the plugin from 0.4 on)
 
 Usage:
@@ -99,8 +101,8 @@ assert [r.allow(10) for _ in range(4)] == [True, True, True, False]
 """
 # humanizer is opt-in and interactive, so it stays out of the bench; AskUserQuestion has no user in -p
 PLUGINS = {"A": (0, 0, 0), "B": (1, 1, 0), "C": (1, 1, 0), "D": (1, 1, 0), "E": (0, 0, 1), "F": (1, 0, 0), "G": (0, 1, 0),
-           "T": (0, 0, 1), "R": (0, 0, 1), "P": (0, 0, 1), "V": (0, 0, 0)}  # (caveman, ponytail, frugal plugin); P: plugin on, not invoked
-PREFIX = {"C": "/frugal ", "D": "/frugal ", "E": "/frugal:frugal ", "T": "/frugal:frugal tight ", "R": "/frugal:frugal delegate ", "V": "/frugal:frugal "}  # V: a frugal variant from FRUGAL_VARIANT_DIR via --plugin-dir  # C, D: loose-skill era
+           "T": (0, 0, 1), "R": (0, 0, 1), "P": (0, 0, 1), "V": (0, 0, 0), "N": (0, 0, 1), "S": (0, 0, 1)}  # (caveman, ponytail, frugal plugin); P: plugin on, not invoked
+PREFIX = {"C": "/frugal ", "D": "/frugal ", "E": "/frugal:frugal ", "T": "/frugal:frugal tight ", "R": "/frugal:frugal delegate ", "V": "/frugal:frugal ", "N": "/frugal:frugal ", "S": "/frugal:frugal "}  # V: a frugal variant from FRUGAL_VARIANT_DIR via --plugin-dir  # C, D: loose-skill era
 
 
 def cond_settings(cond):
@@ -132,7 +134,7 @@ def run_one(job, model):
             cmd += ["--plugin-dir", os.environ["FRUGAL_VARIANT_DIR"]]
         # claude.ai connectors connect at a random point of startup; a plugin MCP server delays the first request, so
         # they reached V's context and not A's (+2k tok on Sonnet t0_ok in 0.29.0). Off for every condition.
-        env = {**os.environ, "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
+        env = {**os.environ, "ENABLE_CLAUDEAI_MCP_SERVERS": "false", **({"FRUGAL_DELEGATED": "1"} if cond == "N" else {})}
         p = subprocess.run(cmd, cwd=work, capture_output=True, text=True, encoding="utf-8", env=env, timeout=900)
         stream += p.stdout
         rcs.append(p.returncode)
@@ -141,10 +143,25 @@ def run_one(job, model):
             print(f"limit {out.name}", flush=True)
             return
     out.mkdir(parents=True, exist_ok=True)
+    if cond == "S":
+        (out / "delegates.json").write_text(json.dumps(delegate_jobs(work)), encoding="utf-8")
     (out / "stream.jsonl").write_text(stream, encoding="utf-8")
     shutil.copytree(work, out / "workdir", dirs_exist_ok=True)
     shutil.rmtree(work.parent, ignore_errors=True)
     print(f"done {out.name} rc={max(rcs)}", flush=True)
+
+
+def delegate_jobs(work):
+    """The last line of each delegated job that ran in this run's folder: delegates default to the folder the chat runs in."""
+    root, last = os.path.normcase(str(work)), {}
+    for line in (Path.home() / ".frugal" / "jobs.jsonl").read_text(encoding="utf-8").splitlines():
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if "id" in j and os.path.normcase(j.get("cwd", "")).startswith(root):
+            last[j["id"]] = j
+    return list(last.values())
 
 
 def check(task, d, texts):
@@ -240,6 +257,11 @@ def parse(run_dir):
     return tools, results
 
 
+def delegated(d):
+    jobs = json.loads((d / "delegates.json").read_text(encoding="utf-8")) if (d / "delegates.json").exists() else []
+    return dict(dcost=sum(j.get("cost", 0) or 0 for j in jobs), dtok=sum(j.get("tokens", 0) or 0 for j in jobs), djobs=len(jobs))
+
+
 def report():
     rows = []
     for d in sorted(p for p in RES.iterdir() if p.is_dir()):
@@ -255,6 +277,7 @@ def report():
                          out=tot(lambda r: u(r, "output_tokens")), inp=tot(inp),
                          turns=tot(lambda r: r.get("num_turns", 0)), cost=rs[-1].get("total_cost_usd", 0),  # cumulative across --resume calls
                          sec=tot(lambda r: r.get("duration_ms", 0)) / 1000,
+                         **delegated(d),
                          tools=sum(tools.values()), skills=",".join(k for k in tools if k.startswith("Skill")),
                          per_msg=[dict(cost=r.get("total_cost_usd", 0) - (rs[i - 1].get("total_cost_usd", 0) if i else 0),
                                        inp=inp(r), out=u(r, "output_tokens")) for i, r in enumerate(rs)]))
@@ -264,17 +287,28 @@ def report():
         print(f"| {r['cond']} | {r['task']} | {r['rep']} | {r['ok']} | {r['out']} | {r['inp']} | {r['turns']} | {r['tools']} | {r['cost']:.3f} | {r['sec']:.0f} | {r['skills']} |")
     print("\n| cond | runs | passed | median output tok | median input tok | median cost USD | total cost USD |")
     print("|---|---|---|---|---|---|---|")
-    for c in "ABCDEFGPRTV":
+    for c in "ABCDEFGNPRSTV":
         g = [r for r in rows if r["cond"] == c and r["task"] != "t4_long"]
         if g:
             print(f"| {c} | {len(g)} | {sum(r['ok'] for r in g)} | {st.median(r['out'] for r in g):.0f} | {st.median(r['inp'] for r in g):.0f} | "
                   f"{st.median(r['cost'] for r in g):.3f} | {sum(r['cost'] for r in g):.3f} |")
+    deleg = [r for r in rows if r["cond"] in "NS"]
+    if deleg:
+        # Main is what this account pays; secondary cost is what Claude and Grok delegates report (Codex and free OpenCode report none).
+        print("\n| cond | task | runs | passed | median main cost USD | median secondary cost USD | median secondary tok | delegated jobs |")
+        print("|---|---|---|---|---|---|---|---|")
+        for t in sorted({r["task"] for r in deleg}):
+            for c in "NS":
+                g = [r for r in deleg if r["cond"] == c and r["task"] == t]
+                if g:
+                    print(f"| {c} | {t} | {len(g)} | {sum(r['ok'] for r in g)} | {st.median(r['cost'] for r in g):.3f} | "
+                          f"{st.median(r['dcost'] for r in g):.3f} | {st.median(r['dtok'] for r in g):.0f} | {sum(r['djobs'] for r in g)} |")
     fixed = [r for r in rows if r["task"] == "t0_ok" and r["rep"] != "1"]  # rep 1 pays the cache write
     if fixed:
         base = [r for r in fixed if r["cond"] == "A"]
         print("\n| cond | t0_ok warm runs | median input tok | vs A | median cost USD | vs A |")
         print("|---|---|---|---|---|---|")
-        for c in "ABCDEFGPRTV":
+        for c in "ABCDEFGNPRSTV":
             g = [r for r in fixed if r["cond"] == c]
             if g:
                 i, k = st.median(r["inp"] for r in g), st.median(r["cost"] for r in g)
@@ -283,11 +317,11 @@ def report():
                 print(f"| {c} | {len(g)} | {i:.0f} | {di} | {k:.4f} | {dk} |")
     long = [r for r in rows if r["task"] == "t4_long"]
     if long:
-        print("\n| t4_long msg | " + " | ".join(f"{c} median cost USD | {c} median input tok" for c in "ABCDEFGPRTV") + " |")
-        print("|---|" + "---|---|" * 11)
+        print("\n| t4_long msg | " + " | ".join(f"{c} median cost USD | {c} median input tok" for c in "ABCDEFGNPRSTV") + " |")
+        print("|---|" + "---|---|" * 13)
         for i in range(len(TASKS["t4_long"])):
             cells = []
-            for c in "ABCDEFGPRTV":
+            for c in "ABCDEFGNPRSTV":
                 g = [r["per_msg"][i] for r in long if r["cond"] == c]
                 cells += [f"{st.median(m['cost'] for m in g):.3f}", f"{st.median(m['inp'] for m in g):.0f}"] if g else ["-", "-"]
             print(f"| {i + 1} | " + " | ".join(cells) + " |")
