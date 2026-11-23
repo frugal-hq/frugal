@@ -827,11 +827,16 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 return f"{notice}{do_here(check, c, tail)}\n\nChanges by {label}, untested:\n{out[:2000]}"
             if c != 0:
                 failure = f"check `{check}` failed: {tail[-400:]}"
+                check_failure = failure
+                left = sorted(f for f, t in touched(cwd).items() if before.get(f) != t) if kind == "edit" else []
+                if left:
+                    failure += (f" Its changes are still in the tree ({', '.join(left[:30])}): review and keep them, "
+                                "finish only what the check still needs, and never revert them.")
                 failed_try(job, a, model, code, began, failure)
                 failed_kinds.add(a["kind"])
-                if failure in check_fails:
+                if check_failure in check_fails:
                     break  # the same check output after two accounts' work: the check itself fails, another try only redoes it
-                check_fails.add(failure)
+                check_fails.add(check_failure)
                 continue
             return f"{notice}Done by {label}; check `{check}` exited 0, passed:\n{tail[-300:]}\n\nAgent notes:\n{out[:2000]}"
         if raw:
@@ -851,7 +856,7 @@ SPEC = {
                    "test or build runs, edits you can brief exactly. Independent pieces go in \"tasks\" and run in parallel. "
                    "Keep design and the final check here; \"do it here\" means do it yourself.",
     "inputSchema": {"type": "object", "required": ["kind"], "properties": {
-        "task": {"type": "string", "description": "Goal, exact paths, done-when. With kind run it is never executed: it only guides the explanation of a failure."},
+        "task": {"type": "string", "description": "Goal, exact paths, done-when. With kind run it is never executed: it only guides the explanation of a failure. Never ask an edit delegate to commit: Codex cannot write .git; commit here after reviewing the diff."},
         "tasks": {"type": "array", "items": {"type": "string"}, "description": "Independent briefs, run in parallel."},
         "kind": {"type": "string", "enum": ["search", "edit", "run"], "description": "search: read-only. edit: changes files. run: runs commands and reports."},
         "check": {"type": "string", "description": "Bash command (Git Bash on Windows) that exits 0 when done right; only this brief's own files, never ones a parallel brief makes. With kind run: the command to run, once; put every command to run here, chained with &&. A pipe exits with its last stage: put `set -o pipefail;` first when piping a run into tail or head, or a failing run passes."},
@@ -1938,7 +1943,7 @@ def selftest():
     accounts = [{"id": "o1", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"}, {"id": "o2", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"},
                 {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude"}]
     tries, replies = [], []
-    g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (tries.append((argv[0], timeout)), replies.pop(0))[1],
+    g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (tries.append((argv[0], timeout)), prompts.append(prompt), replies.pop(0))[2],
              load=lambda: {"accounts": [dict(a) for a in accounts]}, save=lambda data: None, log_job=lambda entry: None)
     try:
         replies[:] = [(1, "", "server error"), (0, "ok", "")]
@@ -1952,9 +1957,10 @@ def selftest():
         replies[:] = [(0, "ok", "")] * 4
         seen = []
         g.update(run_check=lambda check, cwd, timeout=300: (1, "No such file: other.py"),
-                 touched=lambda cwd: (seen.append(1), {} if len(seen) == 1 else {"new.py": 1})[1])
+                 touched=lambda cwd: (seen.append(1), {} if len(seen) <= 2 else {"new.py": 1})[1])
         r = brief("copy", "edit", "python -m py_compile new.py other.py", "standard", None, ".")
         assert len(tries) == 2 and "Changed, untested: new.py;" in r, (tries, r)
+        assert "never revert them" in prompts[-1] and "new.py" in prompts[-1], prompts[-1]
     finally:
         g.update(real)
     return "selftest ok"
