@@ -170,25 +170,86 @@ def deck_only():
     return [n for n in (deck.get("delegateOnly") or []) if isinstance(n, str)] if isinstance(deck, dict) else []
 
 
+def refresh_token(entry):
+    """Refresh an MCP OAuth login using its discovered token endpoint, or return None on failure."""
+    import http.client, urllib.error, urllib.parse, urllib.request
+    try:
+        discovery = entry["discoveryState"]
+        metadata_url = discovery.get("authServerMetadataUrl")
+        base = discovery.get("authorizationServerUrl", "").rstrip("/")
+        urls = [metadata_url] if metadata_url else [base + "/.well-known/oauth-authorization-server", base + "/.well-known/openid-configuration"]
+        for i, url in enumerate(urls):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "frugal"}), timeout=20) as r:
+                    if r.status != 200:
+                        return None
+                    metadata = json.load(r)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 404 or i + 1 == len(urls):
+                    return None
+        form = {"grant_type": "refresh_token", "refresh_token": entry["refreshToken"], "client_id": entry["clientId"]}
+        if entry.get("clientSecret"):
+            form["client_secret"] = entry["clientSecret"]
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "frugal"}
+        with urllib.request.urlopen(urllib.request.Request(metadata["token_endpoint"], urllib.parse.urlencode(form).encode(), headers), timeout=20) as r:
+            return json.load(r) if r.status == 200 else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException):
+        return None
+
+
 def with_auth(servers, now=None):
     """Hands this session's MCP OAuth access token to the delegate as a header, so no account logs in to a server twice.
-    The delegate never sees the refresh token, so it never rotates the session's login. Returns (servers, expired names)."""
+    Frugal refreshes an expired token itself and writes it back, as the session would. The delegate never sees the refresh
+    token, so it never rotates the session's login. Returns (servers, expired names)."""
     folder = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = (Path(folder) if folder else HOME / ".claude") / ".credentials.json"
     try:
-        tokens = json.loads((Path(folder) if folder else HOME / ".claude").joinpath(".credentials.json").read_text(encoding="utf-8")).get("mcpOAuth") or {}
+        tokens = json.loads(path.read_text(encoding="utf-8")).get("mcpOAuth") or {}
     except (OSError, ValueError):
         return servers, []  # frugal: macOS keeps these in the keychain; read it with `security find-generic-password` if needed
     now = time.time() if now is None else now
     out, expired = {}, []
     for name, conf in servers.items():
         headers = conf.get("headers") or {}
-        t = next((t for t in tokens.values() if t.get("serverName") == name and t.get("serverUrl") == conf.get("url") and t.get("accessToken")), None)
+        key, t = max(((k, t) for k, t in tokens.items() if t.get("serverName") == name and t.get("serverUrl") == conf.get("url") and t.get("accessToken")),
+                     key=lambda pair: (pair[1].get("expiresAt") or 0, bool(pair[1].get("refreshToken"))), default=(None, None))
         if not t or not conf.get("url") or any(k.lower() == "authorization" for k in headers):
             out[name] = conf
-        elif t.get("expiresAt") and t["expiresAt"] / 1000 < now + 300:
-            expired.append(name)
-        else:
-            out[name] = {**conf, "headers": {**headers, "Authorization": f"Bearer {t['accessToken']}"}}
+            continue
+        if t.get("expiresAt") is not None and t["expiresAt"] / 1000 <= now + 300:
+            tmp = None
+            try:
+                result = refresh_token(t) if t.get("refreshToken") and t.get("clientId") else None
+                if not isinstance(result, dict) or not isinstance(result.get("access_token"), str) or not result["access_token"]:
+                    raise ValueError("Missing access token")
+                updates = {"accessToken": result["access_token"]}
+                if "expires_in" in result:
+                    updates["expiresAt"] = int(now * 1000) + int(float(result["expires_in"]) * 1000)
+                if "refresh_token" in result:
+                    if not isinstance(result["refresh_token"], str) or not result["refresh_token"]:
+                        raise ValueError("Invalid refresh token")
+                    updates["refreshToken"] = result["refresh_token"]
+                data = json.loads(path.read_text(encoding="utf-8"))  # keep other keys changed during the HTTP call
+                current = data["mcpOAuth"][key]
+                if any(current.get(k) != t.get(k) for k in ("serverName", "serverUrl", "accessToken", "refreshToken")):
+                    raise ValueError("Login changed during refresh")
+                current.update(updates)
+                if "expires_in" not in result:
+                    current.pop("expiresAt", None)
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+                    tmp = Path(f.name)
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, path)
+                t = current
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+                expired.append(name)
+                continue
+            finally:
+                if tmp is not None:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink(missing_ok=True)
+        out[name] = {**conf, "headers": {**headers, "Authorization": f"Bearer {t['accessToken']}"}}
     return out, expired
 
 
@@ -1336,6 +1397,41 @@ def selftest():
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
     assert nudge(EXPLORE_BUDGET + 1, 0).startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1}") and nudge(9, 1) == "" and nudge(EXPLORE_BUDGET, 0) == ""
+    # Duplicate OAuth entries: refresh the newest login and preserve the stale entry and concurrent changes.
+    saved_cfg, saved_refresh = os.environ.get("CLAUDE_CONFIG_DIR"), refresh_token
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            os.environ["CLAUDE_CONFIG_DIR"] = folder
+            credentials = Path(folder) / ".credentials.json"
+            stale = {"serverName": "pylon", "serverUrl": "https://p/", "accessToken": "stale"}
+            entry = {**stale, "accessToken": "old", "expiresAt": 1000_000, "refreshToken": "r1", "clientId": "client"}
+            data = {"mcpOAuth": {"stale": stale, "current": entry}}
+            credentials.write_text(json.dumps(data), encoding="utf-8")
+
+            def refreshed(t):
+                assert t == entry
+                latest = json.loads(credentials.read_text(encoding="utf-8"))
+                latest["other"] = {"keep": True}
+                latest["mcpOAuth"]["current"]["scope"] = "read"
+                credentials.write_text(json.dumps(latest), encoding="utf-8")
+                return {"access_token": "new", "expires_in": 3600, "refresh_token": "r2"}
+
+            globals()["refresh_token"] = refreshed
+            servers, expired = with_auth({"pylon": {"url": "https://p/"}}, now=1000)
+            assert not expired and servers["pylon"]["headers"]["Authorization"] == "Bearer new"
+            stored = json.loads(credentials.read_text(encoding="utf-8"))
+            assert stored["mcpOAuth"]["stale"] == stale and stored["other"] == {"keep": True}
+            assert stored["mcpOAuth"]["current"] == {**entry, "accessToken": "new", "expiresAt": 4600_000, "refreshToken": "r2", "scope": "read"}
+            credentials.write_text(json.dumps(data), encoding="utf-8")
+            globals()["refresh_token"] = lambda t: None
+            assert with_auth({"pylon": {"url": "https://p/"}}, now=1000) == ({}, ["pylon"])
+            assert json.loads(credentials.read_text(encoding="utf-8")) == data
+    finally:
+        globals()["refresh_token"] = saved_refresh
+        if saved_cfg is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = saved_cfg
     cfg = Path(tempfile.mkdtemp())
     (cfg / ".claude.json").write_text(json.dumps({"mcpServers": {"sm": {"command": "a"}}, "projects": {
         str(cfg).replace("\\", "/"): {"mcpServers": {"p": {"command": "b"}}}, "elsewhere": {"mcpServers": {"q": {"command": "c"}}}}}), encoding="utf-8")
