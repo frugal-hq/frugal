@@ -816,11 +816,12 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                     elif code != 0 and LIMIT.search(out + err):
                         x["exhausted_until"] = time.time() + HOUR
                     else:
-                        # oc-beam failed 4 times with invalid_function_parameters and GLM/crouton models 8 times in two weeks,
-                        # each retried every task.
-                        if code != 0 and code != 124:
-                            x["errors"] = (x.get("errors", 0) if x.get("errors_day") == today() else 0) + 1
-                            x["errors_day"] = today()
+                        # GLM and crouton OpenCode models failed 33 times in two weeks with the same "Unexpected server error",
+                        # each retried every task. Only the same error counts, ids and timestamps aside: one network blip never benches.
+                        if code != 0 and code != 124 and x["kind"] == "opencode":
+                            sig = re.sub(r"\w*\d\w*", "", (err or out)[-300:])
+                            same = x.get("errors_day") == today() and x.get("error_sig") == sig
+                            x["errors"], x["errors_day"], x["error_sig"] = (x.get("errors", 0) if same else 0) + 1, today(), sig
                             if x["errors"] >= 3:
                                 x["exhausted_until"] = time.time() + 6 * HOUR
                                 x["errors"] = 0
@@ -1988,11 +1989,17 @@ def selftest():
         g["run_check"] = lambda check, cwd, timeout=300: (1, "selftest ok")
         r = brief("copy", "edit", "echo 'selftest ok'; test 1 = 2", "standard", None, ".")
         assert "check `echo 'selftest ok'; test 1 = 2` exited 1: selftest ok" in r and "no error in the output" in r, r
-        # Generic errors accumulate across tasks, reset each day and on success, and bench the account for six hours.
-        accounts[:] = [{"id": "c", "kind": "claude", "errors": 2, "errors_day": "2000-01-01"}]
+        # The same OpenCode error three times in a day, ids aside, benches the account for six hours; another error or a success restarts the count.
+        accounts[:] = [{"id": "c", "kind": "claude"}]
         g["load"] = lambda: {"accounts": accounts}
-        for code, errors in [(1, 1), (1, 2), (0, 0), (1, 1), (1, 2), (1, 0)]:
-            replies[:] = [(code, "ok" if code == 0 else "", "" if code == 0 else "invalid_function_parameters")]
+        for _ in range(3):
+            replies[:] = [(1, "", "Unexpected server error")]
+            brief("look", "search", None, "standard", None, ".")
+        assert "exhausted_until" not in accounts[0] and "errors" not in accounts[0], accounts
+        accounts[:] = [{"id": "c", "kind": "opencode", "model": "prov/m", "errors": 2, "errors_day": "2000-01-01", "error_sig": "A ref err_"}]
+        for code, msg, errors in [(1, "A ref err_1a", 1), (1, "A ref err_2b", 2), (0, "", 0), (1, "A ref err_3c", 1), (1, "B", 1),
+                                  (1, "B", 2), (1, "B", 0)]:
+            replies[:] = [(code, "ok" if code == 0 else "", msg)]
             began = time.time()
             brief("look", "search", None, "standard", None, ".")
             assert accounts[0]["errors"] == errors and accounts[0]["errors_day"] == today(), accounts
