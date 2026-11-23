@@ -1,11 +1,11 @@
-"""frugal accounts: secondary Claude, Codex, Grok and OpenCode logins that take delegated work.
+"""frugal accounts: secondary Claude, Codex, Grok, Gemini and OpenCode logins that take delegated work.
 
 One file, stdlib only, four roles:
   server.py                 MCP server (stdio) exposing `delegate` while an account is set up
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
-  server.py list | add <claude|codex|grok> <id> | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | selftest
+  server.py list | add <claude|codex|grok> <id> | add gemini <id> [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
 """
 import concurrent.futures, contextlib, datetime, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
@@ -30,6 +30,8 @@ RULES = {
     # grok uses the CLI default model; it takes low, medium, high, xhigh (rejects minimal and max yet still exits 0).
     "grok": {"efforts": ["low", "medium", "high", "xhigh"],
              "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "xhigh")}},
+    "gemini": {"efforts": [],
+               "levels": {"light": ("flash-lite", None), "standard": ("flash", None), "heavy": ("pro", None), "max": ("pro", None)}},
     # OpenCode runs the one model its account names; --variant is per provider, and one a model lacks is ignored.
     "opencode": {"efforts": ["low", "medium", "high"],
                  "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "high")}},
@@ -40,7 +42,7 @@ DEFAULT_LEVEL = {"search": "standard", "run": "standard", "edit": "standard", "n
 LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|quota|too many requests|\b429\b", re.I)
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
 AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oauth token (has )?(expired|been revoked)"
-                  r"|invalid (api|x-api) key|authentication_error|not authenticated|not signed in|login required", re.I)
+                  r"|invalid (api|x-api) key|api key not valid|authentication_error|not authenticated|not signed in|login required", re.I)
 HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|(?<![.\w-])(pytest|jest|vitest|tsc|gradlew|mvn)(\.(bat|cmd|exe))?(?![.\w/-])|(?<![.\w/\\-])gradle(?![.\w/-])|\bpython\S*\s+\S*bench\.py\b"
                        r"|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b", re.I)
 CODEX_RULES = (
@@ -385,6 +387,8 @@ def active():
 
 
 def fit(effort, efforts):
+    if not efforts:
+        return None
     i = EFFORTS.index(effort) if effort in EFFORTS else 1
     below = [e for e in efforts if EFFORTS.index(e) <= i]
     return below[-1] if below else efforts[0]
@@ -397,12 +401,14 @@ def choose(a, kind, level=None, effort=None):
     if a["kind"] == "codex":
         models = codex_models(a) or a.get("models") or []
         model = next((slug for slug in models if re.fullmatch(rf"gpt-[\d.]+-{model}", slug)), None)
+    if a["kind"] == "gemini":
+        model = next((slug for slug in gemini_models() if re.fullmatch(rf"gemini-[\d.]+-{model}", slug)), "auto") if model != "pro" else "auto"
     if a["kind"] == "opencode":
         model = a["model"]
     return model, fit(effort or base, rule["efforts"])
 
 
-STRONG = {"claude": 0, "codex": 1, "grok": 2}  # heavy and max: Claude, Codex, Grok; free OpenCode models never
+STRONG = {"claude": 0, "codex": 1, "grok": 2, "gemini": 3}  # heavy and max: Claude, Codex, Grok, then Gemini; free OpenCode models never
 
 
 def order(accounts, busy, level=None):
@@ -422,6 +428,19 @@ def codex_models(a=None):
         return []
 
 
+GEMINI_MODELS = None
+
+
+def gemini_models():
+    global GEMINI_MODELS
+    if GEMINI_MODELS is None:
+        exe = shutil.which("gemini")
+        r = run_tree([exe, "models", "list"], 60) if exe else None
+        models = set(re.findall(r"(?m)^gemini-\d+(?:\.\d+)*-(?:flash-lite|flash|pro)(?=\s|$)", r[1])) if r and r[0] == 0 else set()
+        GEMINI_MODELS = sorted(models, key=lambda m: tuple(map(int, m.split("-")[1].split("."))), reverse=True)
+    return GEMINI_MODELS
+
+
 def codex_mcp(a=None):
     try:
         return set(tomllib.loads((Path(a["home"]) if a and a.get("home") else HOME / ".codex").joinpath("config.toml").read_text(encoding="utf-8")).get("mcp_servers", {}))
@@ -431,11 +450,20 @@ def codex_mcp(a=None):
 
 def blocked(a, data):
     m = (a.get("model") or "").lower()
-    return (a["kind"] == "opencode" and m.startswith("opencode/") and any(t in m for t in TRAINING_MODELS)
+    return ((a["kind"] == "gemini" and not a.get("paid")
+             or a["kind"] == "opencode" and m.startswith("opencode/") and any(t in m for t in TRAINING_MODELS))
             and not data.get("opencode_allow_training", False))
 
 
+def training_message(a):
+    return ("its key is on the free tier and may train on your data (opencode-training on; re-add with --paid if billing is on)"
+            if a["kind"] == "gemini" else "its model may train on your data (opencode-training on)")
+
+
 def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=(), mcp_args=()):
+    if a["kind"] == "gemini":
+        # A non-empty -p also works in nested sessions; the brief arrives on stdin, as for Claude and Codex.
+        return ["gemini", "-p", "Follow the brief on stdin.", "-o", "json", "--approval-mode", "plan" if kind in ("search", "note") else "yolo", "-m", model]
     if a["kind"] == "claude" and kind == "note":
         return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
@@ -616,6 +644,10 @@ def cli_reply(agent, out, err, job):
             j = json.loads(out)
             add((j.get("usage") or {}).get("total_tokens"), j.get("total_cost_usd"))
             return j.get("text") or "", err or ("" if j.get("text") else out)
+        if agent == "gemini":  # JsonFormatter: {session_id, response, stats, error?, warnings?}
+            j = json.loads(out)
+            add(sum((m.get("tokens") or {}).get("total") or 0 for m in ((j.get("stats") or {}).get("models") or {}).values()))
+            return ("", err or (j["error"].get("message") or out)) if j.get("error") else (j.get("response") or "", err)
         if agent == "opencode":  # --format json: one event per line
             events = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
             if not events:
@@ -701,6 +733,10 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             only, kinds = data.get("claude_only_mcp", []), data.get("mcp_kinds", {})  # both set per server in Frugal Deck's MCP servers
             pool = [a for a in order(data["accounts"], BUSY, level) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode"))
                     and not any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers) and not blocked(a, data)]
+            if servers:  # frugal: Gemini delegates do not take MCP servers yet.
+                if pool and all(a["kind"] == "gemini" for a in pool):
+                    return "Gemini delegates do not take MCP servers yet."
+                pool = [a for a in pool if a["kind"] != "gemini"]
             if not pool:
                 break
             # After a failure another provider goes first: three free OpenCode models failed one after another on its server errors.
@@ -770,7 +806,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                         x["day"] = today()
             save(data)
         notice = relogin(relog)
-        label = f"{name(a['id'])} ({', '.join(filter(None, [model, f'{eff} effort']))})"
+        label = f"{name(a['id'])} ({', '.join(filter(None, [model, f'{eff} effort' if eff else None]))})"
         if code != 0 or not out:
             failure = (err or out or f"exit {code}")[-400:]
             failed_try(job, a, model, code, began, failure)
@@ -1199,13 +1235,15 @@ def hook_stop(event):
 def account_env(a):
     # OpenCode keeps its login and sessions in its own data folder per account
     if a.get("home"):
-        return {{"codex": "CODEX_HOME", "grok": "GROK_HOME"}[a["kind"]]: a["home"]}
+        return {{"codex": "CODEX_HOME", "grok": "GROK_HOME", "gemini": "GEMINI_CLI_HOME"}[a["kind"]]: a["home"]}
     return {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {"XDG_DATA_HOME": a["data_dir"]} if a.get("data_dir") else {}
 
 
 def child_env(a, extra=None):
     # The main account uses the default folder, so its delegate drops the CLAUDE_CONFIG_DIR this session may run with.
     env = {**os.environ, **(extra or {}), **account_env(a)}
+    if a.get("kind") == "gemini":
+        env.pop("GEMINI_API_KEY", None)  # use this account's .env, never the parent's key
     if env.get("CLAUDE_CONFIG_DIR") and same(env["CLAUDE_CONFIG_DIR"]) == same(HOME / ".claude"):
         del env["CLAUDE_CONFIG_DIR"]
     return env
@@ -1226,6 +1264,11 @@ def read_json(path):
 
 def logged_in(a):
     """(signed in, email or None). Grok and OpenCode keep their login in auth.json, which grok logout leaves as {}."""
+    if a["kind"] == "gemini":
+        try:
+            return bool(re.search(r"^GEMINI_API_KEY=.+$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)), None
+        except OSError:
+            return False, None
     if a["kind"] in ("grok", "opencode"):
         auth = read_json(Path(a["data_dir"]) / "opencode" / "auth.json" if a["kind"] == "opencode"
                          else Path(a.get("home") or os.environ.get("GROK_HOME") or HOME / ".grok") / "auth.json")
@@ -1277,13 +1320,16 @@ def cli(args):
     if args[:1] == ["list"] or not args:
         rows = [f"{a['id']}: {a['kind']}{f" {a['model']}" if a.get('model') else ''}{' (off)' if not a.get('enabled', True) else ''}, used today {a.get('used', 0) if a.get('day') == today() else 0}"
                 + (", at its limit" if a.get("exhausted_until", 0) > time.time() else "")
-                + (", blocked: its model may train on your data (opencode-training on)" if blocked(a, data) else "")
+                + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
-        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add opencode <id> <provider/model>"
-    if args[0] == "add" and len(args) == (4 if args[1:2] == ["opencode"] else 3) and args[1] in RULES:
+        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add gemini <id> [--paid] | add opencode <id> <provider/model>"
+    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] == "gemini" and args[3:] == ["--paid"]):
         kind, aid = args[1], args[2]
-        if any(a["id"] == aid for a in data["accounts"]):
-            return f"{aid} is already set up."
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", aid):
+            raise SystemExit("Account id must contain only letters, numbers, underscores or hyphens.")
+        existing = next((a for a in data["accounts"] if a["id"] == aid), None)
+        if existing and not (kind == existing["kind"] == "gemini"):
+            raise SystemExit(f"{aid} is already set up.")
         if not shutil.which(kind):
             npm = shutil.which("npm")
             if not npm:
@@ -1301,17 +1347,35 @@ def cli(args):
                 Path(a["home"]).mkdir(parents=True, exist_ok=True)
             if kind == "codex":
                 a["models"] = codex_models(a)
+        elif kind == "gemini":
+            key = sys.stdin.readline().rstrip("\r\n")
+            if not key or not key.isprintable() or any(c.isspace() for c in key):
+                raise SystemExit("Gemini API key must be non-empty printable text without spaces.")
+            a["home"], a["paid"] = str(DIR / f"gemini-{aid}"), "--paid" in args[3:]
+            path = Path(a["home"]) / ".gemini" / ".env"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+                    tmp = Path(f.name)
+                    if os.name != "nt":
+                        os.chmod(tmp, 0o600)
+                    f.write(f"GEMINI_API_KEY={key}\n")
+                os.replace(tmp, path)
+            finally:
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
         elif kind == "opencode":
             a["model"], a["data_dir"] = args[3], str(DIR / f"opencode-{aid}")
             if blocked(a, data):
-                return (f"{args[3]} may train on what it receives, so frugal blocks it. "
+                raise SystemExit(f"{args[3]} may train on what it receives, so frugal blocks it. "
                         "To allow such models, run: opencode-training on")
-        if kind != "opencode":
+        if kind not in ("opencode", "gemini"):
             a["needs_login"] = True  # out of the pool until login() confirms it
-        data["accounts"].append(a)
+        data["accounts"] = [x for x in data["accounts"] if x["id"] != aid] + [a]
         save(data)
         PENDING.append(a)
-        return f"Added {aid}."
+        return f"Added {aid}." + (f" Blocked: {training_message(a)}." if blocked(a, data) else "")
     if args[0] == "opencode-training" and args[1:] in (["on"], ["off"]):
         data["opencode_allow_training"] = args[1] == "on"
         save(data)
@@ -1382,14 +1446,55 @@ def selftest():
     assert blocked(pickle, {}) and not blocked(pickle, {"opencode_allow_training": True}) and not blocked(oc, {})
     assert not blocked({"kind": "opencode", "model": "openrouter/nvidia/nemotron-x"}, {})
     assert argv_for(codex, "edit", None, "low", ["serviceminder"])[-5:-3] == ["-c", "mcp_servers.serviceminder.enabled=false"]
+    # New providers and Deck commands stay isolated from the machine's accounts and keys.
     import io
     g = globals()
-    real = {k: g[k] for k in ("DIR", "FILE", "PENDING")}
+    real = {k: g[k] for k in ("DIR", "FILE", "PENDING", "GEMINI_MODELS", "run_tree")}
     saved_which, saved_run, saved_stdin = shutil.which, subprocess.run, sys.stdin
+    saved_key = os.environ.get("GEMINI_API_KEY")
     try:
         with tempfile.TemporaryDirectory() as folder:
-            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[])
+            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[], GEMINI_MODELS=None)
             shutil.which = lambda name: name + ".cmd"
+            calls = []
+            def models_cli(argv, timeout):
+                calls.append(argv)
+                return 0, "auto\ngemini-2.5-pro\ngemini-3.5-flash\ngemini-2.5-flash\ngemini-3.1-flash-lite\ngemini-9.0-flash-preview\n  Description: supersedes gemini-8.0-flash\n", ""
+            g["run_tree"] = models_cli
+            gemini = {"id": "gem", "kind": "gemini"}
+            assert choose(gemini, "search", "light") == ("gemini-3.1-flash-lite", None)
+            assert choose(gemini, "search", "standard", "max") == ("gemini-3.5-flash", None)
+            assert choose(gemini, "edit", "heavy") == choose(gemini, "edit", "max") == ("auto", None)
+            assert calls == [["gemini.cmd", "models", "list"]]  # cached once per process
+            g["GEMINI_MODELS"] = []
+            assert choose(gemini, "search", "light") == choose(gemini, "search", "standard") == ("auto", None)
+            for kind in ("search", "note", "edit", "run"):
+                assert argv_for(gemini, kind, "auto", None) == ["gemini", "-p", "Follow the brief on stdin.", "-o", "json", "--approval-mode",
+                                                                "plan" if kind in ("search", "note") else "yolo", "-m", "auto"]
+            sys.stdin = io.StringIO("test-key\nignored-second-line\n")
+            assert "free tier" in cli(["add", "gemini", "gem"])
+            gemini = load()["accounts"][0]
+            key_file = DIR / "gemini-gem" / ".gemini" / ".env"
+            assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=test-key\n" and logged_in(gemini) == (True, None)
+            if os.name != "nt":
+                assert key_file.stat().st_mode & 0o777 == 0o600
+            assert account_env(gemini) == {"GEMINI_CLI_HOME": str(DIR / "gemini-gem")}
+            os.environ["GEMINI_API_KEY"] = "parent-test-key"
+            assert "GEMINI_API_KEY" not in child_env(gemini)
+            assert blocked(gemini, {}) and not blocked(gemini, {"opencode_allow_training": True})
+            sys.stdin = io.StringIO("paid-test-key\n")
+            cli(["add", "gemini", "gem", "--paid"])
+            assert len(load()["accounts"]) == 1 and not blocked(load()["accounts"][0], {})
+            for key in ("", " ", "bad key", "bad\tkey", "bad\x00key"):
+                sys.stdin = io.StringIO(key + "\n")
+                try:
+                    cli(["add", "gemini", "gem", "--paid"])
+                    raise AssertionError("Invalid Gemini key accepted")
+                except SystemExit as e:
+                    assert str(e) == "Gemini API key must be non-empty printable text without spaces."
+                assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=paid-test-key\n"
+            key_file.write_text("GEMINI_API_KEY=\n", encoding="utf-8")
+            assert logged_in(gemini) == (False, None)
             for kind in ("codex", "grok"):
                 cli(["add", kind, kind + "1"])
                 cli(["add", kind, kind + "2"])
@@ -1415,9 +1520,26 @@ def selftest():
                 cli(["add", "grok", "install"])
             assert output.getvalue() == "Installing @xai-official/grok...\n"
             assert installs == [(["npm.cmd", "install", "-g", "@xai-official/grok"], {"stdin": subprocess.DEVNULL})]
+            job = {}
+            assert cli_reply("gemini", '{"response":"done","stats":{"models":{"flash":{"tokens":{"total":12}}}}}', "", job) == ("done", "")
+            assert job == {"tokens": 12}
+            assert cli_reply("gemini", '{"error":{"message":"API key not valid"}}', "", {}) == ("", "API key not valid")
+            assert AUTH.search("API key not valid")
+            mcp_real = {k: g[k] for k in ("load", "session_mcp", "with_auth", "mcp_rules")}
+            try:
+                g.update(load=lambda: {"accounts": [{"id": "gem", "kind": "gemini", "paid": True}]},
+                         session_mcp=lambda cwd: {"test": {}}, with_auth=lambda servers: (servers, []),
+                         mcp_rules=lambda servers: ([], [], [], {}))
+                assert brief("look", "search", None, None, None, ".", ["test"]) == "Gemini delegates do not take MCP servers yet."
+            finally:
+                g.update(mcp_real)
     finally:
         g.update(real)
         shutil.which, subprocess.run, sys.stdin = saved_which, saved_run, saved_stdin
+        if saved_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = saved_key
     tmp = DIR / "selftest-transcript.jsonl"
     DIR.mkdir(exist_ok=True)
     tmp.write_text("\n".join(json.dumps(e) for e in [
