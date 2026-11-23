@@ -1285,15 +1285,23 @@ def logged_in(a):
     return r[0] == 0, email
 
 
+def login_command(a):
+    argv = None if a["kind"] == "gemini" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or blocked(a, {})) else {
+        "claude": ["claude", "auth", "login"], "codex": ["codex", "login"], "grok": ["grok", "login"], "opencode": ["opencode", "auth", "login"]}[a["kind"]]
+    return {"argv": argv, "env": account_env(a)}
+
+
 def login(a):
     """Opens a terminal that closes when the login ends, then checks it. Blocks until then, so run it in the background."""
-    env = account_env(a)
-    cmd = {"codex": "codex login", "grok": "grok login", "opencode": "opencode auth login"}.get(a["kind"], "claude auth login")
-    if os.name != "nt":
+    command = login_command(a)
+    env, argv = command["env"], command["argv"]
+    cmd = " ".join(argv or [])
+    if argv and os.name != "nt":
         # frugal: no terminal is opened outside Windows; run login in-process with the user's tty when one is asked for.
         return f"Run in a terminal: {' '.join(f'{k}={v}' for k, v in env.items())} {cmd}, then: login {a['id']}".strip()
-    sets = "".join(f'set "{k}={v}" && ' for k, v in env.items())
-    subprocess.run(f'start "frugal login {a["id"]}" /wait cmd /c "{sets}{cmd}"', shell=True)
+    if argv:
+        sets = "".join(f'set "{k}={v}" && ' for k, v in env.items())
+        subprocess.run(f'start "frugal login {a["id"]}" /wait cmd /c "{sets}{cmd}"', shell=True)
     ok, email = logged_in(a)
     with file_lock():
         data = load()
@@ -1323,6 +1331,16 @@ def cli(args):
                 + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
         return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add gemini <id> [--paid] | add opencode <id> <provider/model>"
+    if args[0] in ("status", "login-command") and len(args) == 2:
+        a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
+        if not a:
+            raise SystemExit(f"No account {args[1]}.")
+        if args[0] == "login-command":
+            return json.dumps(login_command(a))
+        ok = logged_in(a)[0]
+        if ok and a.pop("needs_login", None):
+            save(data)  # Deck signs in in its own terminal; status puts that account back in the pool.
+        return json.dumps({"id": a["id"], "kind": a["kind"], "installed": bool(shutil.which(a["kind"])), "loggedIn": ok})
     if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] == "gemini" and args[3:] == ["--paid"]):
         kind, aid = args[1], args[2]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", aid):
@@ -1388,10 +1406,10 @@ def cli(args):
     if args[0] == "login" and len(args) == 2:
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
-            return f"No account {args[1]}."
+            raise SystemExit(f"No account {args[1]}.")
         PENDING.append(a)
         return f"Signing in {a['id']}."
-    return __doc__
+    raise SystemExit(__doc__)
 
 
 def selftest():
@@ -1482,6 +1500,8 @@ def selftest():
             os.environ["GEMINI_API_KEY"] = "parent-test-key"
             assert "GEMINI_API_KEY" not in child_env(gemini)
             assert blocked(gemini, {}) and not blocked(gemini, {"opencode_allow_training": True})
+            assert json.loads(cli(["status", "gem"])) == {"id": "gem", "kind": "gemini", "installed": True, "loggedIn": True}
+            assert json.loads(cli(["login-command", "gem"])) == {"argv": None, "env": account_env(gemini)}
             sys.stdin = io.StringIO("paid-test-key\n")
             cli(["add", "gemini", "gem", "--paid"])
             assert len(load()["accounts"]) == 1 and not blocked(load()["accounts"][0], {})
@@ -1501,13 +1521,19 @@ def selftest():
                 first, second = [a for a in load()["accounts"] if a["kind"] == kind]
                 assert "home" not in first and second["home"] == str(DIR / (kind + "-" + kind + "2"))
                 assert account_env(second) == {kind.upper() + "_HOME": second["home"]}
+                assert json.loads(cli(["login-command", second["id"]])) == {"argv": [kind, "login"], "env": account_env(second)}
                 if kind == "codex":
                     (Path(second["home"]) / "models_cache.json").write_text('{"models":[{"slug":"gpt-6.2-sol"}]}', encoding="utf-8")
                     assert codex_models(second) == ["gpt-6.2-sol"]
                 else:
                     (Path(second["home"]) / "auth.json").write_text('{"token":"test-token"}', encoding="utf-8")
                     assert logged_in(second) == (True, None)
+                    assert json.loads(cli(["status", second["id"]]))["loggedIn"] and not load()["accounts"][-1].get("needs_login")
+            assert login_command(oc) == {"argv": None, "env": account_env(oc)}
+            assert login_command({**oc, "model": "openrouter/test:free"})["argv"] is None
+            assert login_command(claude) == {"argv": ["claude", "auth", "login"], "env": {}}
             shutil.which = lambda name: None
+            assert json.loads(cli(["status", "gem"])) == {"id": "gem", "kind": "gemini", "installed": False, "loggedIn": False}
             try:
                 cli(["add", "codex", "missing"])
                 raise AssertionError("Missing npm accepted")
@@ -1915,3 +1941,6 @@ if __name__ == "__main__":
             print(cli(cmd), flush=True)
         for a in PENDING:
             print(login(a))
+        if cmd[0] == "add" and PENDING:
+            a = PENDING[-1]
+            print(json.dumps({"ok": True, "id": a["id"], "kind": a["kind"], "loggedIn": logged_in(a)[0]}))
