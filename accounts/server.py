@@ -610,6 +610,7 @@ def run_check(check, cwd, timeout=300):
 ENV_FAIL = re.compile(r"command not found|is not recognized as an internal|permission denied while trying to connect to the docker"
                       r"|cannot connect to the docker daemon|docker daemon is not running|failed to connect to the docker api"
                       r"|error during connect", re.I)
+CHECK_ERROR = re.compile(r"error|fail|traceback|assert|exception|not ok", re.I)
 
 
 def env_failure(code, out):
@@ -632,7 +633,10 @@ def run_brief(text, check, level, effort, cwd, job):
     notes = brief(f"{text}\n\nThe command `{check}` already ran and exited {code}. The end of its output:\n{out[-8000:]}\n\n"
                   "Find the cause of each failure from this output and the code. Do not run the command again, and do not change any file.",
                   "search", None, level, effort, cwd, job=job)
-    return f"frugal: check `{check}` exited {code}, failed:\n{out[-800:]}\n\nAgent notes, not a test result:\n{notes}"
+    reason = f"check `{check}` exited {code}: {out[-400:]}"
+    if not CHECK_ERROR.search(out):
+        reason += " (no error in the output: a silent part such as test, grep -q or git diff --quiet failed)"
+    return f"frugal: {reason}\n\nAgent notes, not a test result:\n{notes}"
 
 
 def cli_reply(agent, out, err, job):
@@ -826,7 +830,9 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             if env_failure(c, tail):
                 return f"{notice}{do_here(check, c, tail)}\n\nChanges by {label}, untested:\n{out[:2000]}"
             if c != 0:
-                failure = f"check `{check}` failed: {tail[-400:]}"
+                failure = f"check `{check}` exited {c}: {tail[-400:]}"
+                if not CHECK_ERROR.search(tail):
+                    failure += " (no error in the output: a silent part such as test, grep -q or git diff --quiet failed)"
                 check_failure = failure
                 left = sorted(f for f, t in touched(cwd).items() if before.get(f) != t) if kind == "edit" else []
                 if left:
@@ -876,7 +882,7 @@ def log_job(entry):
 
 
 def outcome(text, job):
-    if re.match(r"frugal: check `.*` exited \d+, failed", text):
+    if re.match(r"frugal: check `.*` exited [1-9]\d*[:,]", text):
         return "failed"
     if re.search(r"^(Done by |frugal: check `.*` exited 0, passed)", text, re.M):
         return "done"
@@ -1773,7 +1779,8 @@ def selftest():
         assert "echo ok" in prompts[-1] and "exited 0, passed" in r, r
         r = brief("run the tests", "run", "echo boom; exit 1", None, None, ".")  # case 3: the agent's PASS never becomes the result
         head, _, notes = r.partition("Agent notes")
-        assert "exited 1, failed" in head and "boom" in head and "PASS" not in head and "PASS" in notes, r
+        assert "exited 1: boom" in head and "no error in the output" in head and "PASS" not in head and "PASS" in notes, r
+        assert outcome(r, {"account": "stub"}) == "failed", r
         assert "exit 1" in prompts[-1] and "boom" in prompts[-1]
         n = len(prompts)
         r = brief("run the tests", "run", "no-such-command-frugal", None, None, ".")  # missing tool: do it here, no agent
@@ -1961,6 +1968,11 @@ def selftest():
         r = brief("copy", "edit", "python -m py_compile new.py other.py", "standard", None, ".")
         assert len(tries) == 2 and "Changed, untested: new.py;" in r, (tries, r)
         assert "never revert them" in prompts[-1] and "new.py" in prompts[-1], prompts[-1]
+        tries.clear()
+        replies[:] = [(0, "ok", "")] * 3
+        g["run_check"] = lambda check, cwd, timeout=300: (1, "selftest ok")
+        r = brief("copy", "edit", "echo 'selftest ok'; test 1 = 2", "standard", None, ".")
+        assert "check `echo 'selftest ok'; test 1 = 2` exited 1: selftest ok" in r and "no error in the output" in r, r
     finally:
         g.update(real)
     return "selftest ok"
