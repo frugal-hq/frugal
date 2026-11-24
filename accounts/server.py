@@ -916,7 +916,8 @@ SPEC = {
     "name": "delegate",
     "description": "Runs bounded work on the user's secondary accounts so this account's limits last: searches, reading or summarizing files, "
                    "test or build runs, edits you can brief exactly. Independent pieces go in \"tasks\" and run in parallel. "
-                   "Keep design and the final check here; \"do it here\" means do it yourself.",
+                   "Keep design and the final check here; \"do it here\" means do it yourself. "
+                   "A run stops at 10 minutes (heavy 20, max 30): split a brief bigger than that into parts.",
     # With many MCP servers Claude Code defers their tools behind ToolSearch; deferred, delegate went uncalled (2026-11-23: 0 of 5 chats).
     "_meta": {"anthropic/alwaysLoad": True},
     "inputSchema": {"type": "object", "required": ["kind"], "properties": {
