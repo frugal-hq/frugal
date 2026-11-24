@@ -877,7 +877,10 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 failed_try(job, a, model, code, began, failure)
                 failed_kinds.add(a["kind"])
                 if check_failure in check_fails:
-                    break  # the same check output after two accounts' work: the check itself fails, another try only redoes it
+                    # The same check output after two accounts' work: the check itself fails, another try only redoes it.
+                    # Said in the reply, or the chat redid the work here against the same check (2026-11-23, 334K tokens).
+                    failure = f"two accounts' work failed the check the same way; fix the check or the brief before redoing it: {failure}"
+                    break
                 check_fails.add(check_failure)
                 continue
             return f"{notice}Done by {label}; check `{check}` exited 0, passed:\n{tail[-300:]}\n\nAgent notes:\n{out[:2000]}"
