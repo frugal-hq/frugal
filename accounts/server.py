@@ -39,7 +39,7 @@ RULES = {
 PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "grok": "@xai-official/grok",
             "opencode": "opencode-ai", "gemini": "@google/gemini-cli"}
 DEFAULT_LEVEL = {"search": "standard", "run": "standard", "edit": "standard", "note": "light"}  # light (haiku, low) missed most of a 5-question lookup; pass level "light" only for trivial greps. A heads-up note is one judgment, which haiku makes as well as sonnet
-LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|quota|too many requests|\b429\b", re.I)
+LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|hit your [\w-]+ limit|quota|too many requests|\b429\b", re.I)
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
 AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oauth token (has )?(expired|been revoked)"
                   r"|invalid (api|x-api) key|api key not valid|authentication_error|not authenticated|not signed in|login required", re.I)
@@ -431,6 +431,16 @@ def order(accounts, busy, level=None):
     # frugal: rank by measured tokens per kind from jobs.jsonl when more kinds are paid.
     rank = (lambda a: STRONG[a["kind"]]) if level in ("heavy", "max") else (lambda a: a.get("kind") == "grok")
     return sorted(pool, key=lambda a: (rank(a), busy.get(a["id"], 0) * 1000 + (a.get("used", 0) if a.get("day") == day else 0)))
+
+
+def limit_until(text, now=None):
+    # Claude: "You've hit your 5-hour limit · resets 11:30am (America/Lima)"; read as local time.
+    now = time.time() if now is None else now
+    m = re.search(r"resets (\d{1,2})(?::(\d\d))?\s*([ap]m)\b", text, re.I)
+    if not m:
+        return now + HOUR
+    t = datetime.datetime.fromtimestamp(now).replace(hour=int(m[1]) % 12 + 12 * (m[3].lower() == "pm"), minute=int(m[2] or 0), second=0, microsecond=0)
+    return (t if t.timestamp() > now else t + datetime.timedelta(days=1)).timestamp()
 
 
 def codex_models(a=None):
@@ -836,7 +846,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                         x["needs_login"] = True
                         relog.append(a["id"])
                     elif code != 0 and LIMIT.search(out + err):
-                        x["exhausted_until"] = time.time() + HOUR
+                        x["exhausted_until"] = limit_until(out + err)
                     else:
                         # GLM and crouton OpenCode models failed 33 times in two weeks with the same "Unexpected server error",
                         # each retried every task. Only the same error counts, ids and timestamps aside: one network blip never benches.
@@ -1531,6 +1541,12 @@ def selftest():
     assert [a["id"] for a in ready([{"id": "main", "config_dir": str(HOME / ".claude")}, {"id": "cx"}])] == ["cx"]
     os.environ.update({k: v for k, v in saved.items() if v is not None})
     assert AUTH.search("API Error: 401 OAuth token has expired") and AUTH.search("Please run /login") and not AUTH.search("ok")
+    msg = "You've hit your 5-hour limit · resets 11:30am (America/Lima)"
+    assert LIMIT.search(msg)
+    base = datetime.datetime(2026, 11, 24, 9, 0).timestamp()
+    assert limit_until(msg, base) == datetime.datetime(2026, 11, 24, 11, 30).timestamp()
+    assert limit_until(msg, datetime.datetime(2026, 11, 24, 12, 0).timestamp()) == datetime.datetime(2026, 11, 25, 11, 30).timestamp()
+    assert limit_until("resets 12pm", base) == datetime.datetime(2026, 11, 24, 12, 0).timestamp() and limit_until("quota", base) == base + HOUR
     assert [a["id"] for a in order(pool, {"old": 1})] == ["b", "a", "old"]
     mixed = [{"id": "o", "kind": "opencode"}, {"id": "g", "kind": "grok"}, {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude", "used": 9, "day": today()}]
     assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["c", "x", "g"] and order(mixed, {}, "standard")[0]["id"] == "o"
