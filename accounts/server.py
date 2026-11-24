@@ -1112,8 +1112,16 @@ def rule(event):
         only = deck_only()
         return (f"frugal: secondary accounts are set up. Delegate every bounded task with {TOOL}, level per task; "
                 "keep here only design, judgment calls and the final check."
-                + (f" MCP servers for delegates only, not loaded here: {', '.join(only)}; name one in mcp when a task needs it." if only else ""))
-    return nudge(s.get("reads", 0), s.get("shell", 0), s.get("delegated", 0))
+                + (f" MCP servers for delegates only, not loaded here: {', '.join(only)}; name one in mcp when a task needs it." if only else "")
+                + where(event))
+    line = nudge(s.get("reads", 0), s.get("shell", 0), s.get("delegated", 0))
+    return line and line + where(event)
+
+
+def where(event):
+    # An elevated chat starts in System32, where delegate refuses a call without cwd; the model read that as "delegation is off here".
+    cwd = event.get("cwd") or work_dir({})
+    return f" This chat runs in {cwd}: give every {TOOL} call cwd set to the project folder." if system_dir(cwd) else ""
 
 
 def nudge(reads, shell, delegated):
@@ -1691,6 +1699,7 @@ def selftest():
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
     assert nudge(EXPLORE_BUDGET + 1, 0, 0).startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1} reads") and nudge(9, 20, 1) == "" and nudge(EXPLORE_BUDGET, SHELL_BUDGET, 0) == ""
     assert nudge(0, SHELL_BUDGET + 1, 0).startswith(f"frugal: the last prompt ran {SHELL_BUDGET + 1} shell commands here")
+    assert TOOL in where({"cwd": os.path.join(os.environ["SystemRoot"], "System32")}) and where({"cwd": str(DIR)}) == ""
     # Duplicate OAuth entries: refresh the newest login and preserve the stale entry and concurrent changes.
     saved_cfg, saved_refresh = os.environ.get("CLAUDE_CONFIG_DIR"), refresh_token
     try:
