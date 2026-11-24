@@ -53,6 +53,8 @@ CODEX_RULES = (
     "security or error handling that prevents data loss."
 )
 EXPLORE_BUDGET = 5
+# Shell commands per prompt that neither only read nor build: one chat ran 87 (scripts, edits by sed) in two sessions and delegated none.
+SHELL_BUDGET = 8
 # Edits per prompt before the next one goes to delegate: of 31,524 prompts, 1,340 made more than 3 (93% across 2+ files) and 51 delegated.
 EDIT_BUDGET = 3
 EDITS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
@@ -1105,21 +1107,22 @@ def rule(event):
     ids = ", ".join(a["id"] for a in ready(load()["accounts"]))
     first = s.get("announced") != ids
     DIR.mkdir(exist_ok=True)
-    state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "edits": 0, "delegated": 0, "agent": False}), encoding="utf-8")
+    state(sid).write_text(json.dumps({**s, "announced": ids, "reads": 0, "shell": 0, "edits": 0, "delegated": 0, "agent": False}), encoding="utf-8")
     if first:
         only = deck_only()
         return (f"frugal: secondary accounts are set up. Delegate every bounded task with {TOOL}, level per task; "
                 "keep here only design, judgment calls and the final check."
                 + (f" MCP servers for delegates only, not loaded here: {', '.join(only)}; name one in mcp when a task needs it." if only else ""))
-    return nudge(s.get("reads", 0), s.get("delegated", 0))
+    return nudge(s.get("reads", 0), s.get("shell", 0), s.get("delegated", 0))
 
 
-def nudge(reads, delegated):
+def nudge(reads, shell, delegated):
     # The same line on every prompt went unread (one session got it 120 times and delegated 14 times in 34 prompts);
-    # this one shows only after a prompt that explored here, and says how much.
-    if reads > EXPLORE_BUDGET and not delegated:
-        return f"frugal: the last prompt ran {reads} reads and searches here and delegated none. Send bounded pieces to {TOOL}."
-    return ""
+    # this one shows only after a prompt that worked here past a budget, and says how much.
+    if delegated or (reads <= EXPLORE_BUDGET and shell <= SHELL_BUDGET):
+        return ""
+    done = " and ".join(t for t in (f"{reads} reads and searches" if reads else "", f"{shell} shell commands" if shell > SHELL_BUDGET else "") if t)
+    return f"frugal: the last prompt ran {done} here and delegated none. Send bounded pieces to {TOOL}."
 
 
 QUOTED = re.compile(r"\"(?:\\.|[^\"\\])*\"|'[^']*'")
@@ -1178,6 +1181,11 @@ def gate(event):
                       "run the same command again and it goes through.")
         elif reads_only(cmd):
             count_read()
+        else:
+            s["shell"] = s.get("shell", 0) + 1
+            if s["shell"] == SHELL_BUDGET + 1 and not s.get("delegated"):
+                note = (f"frugal: {SHELL_BUDGET} shell commands here this prompt already. Send bounded runs to {TOOL} (kind \"run\", the command as \"check\") "
+                        "and scripted changes as kind \"edit\"; keep here only what needs this conversation's judgment.")
     elif tool in ("Read", "Grep", "Glob"):
         count_read()
     elif tool in EDITS and not OWN_FILE.search(inp.get("file_path") or inp.get("notebook_path") or ""):
@@ -1681,7 +1689,8 @@ def selftest():
     assert json.loads(mcp_for("opencode", {"py": {"url": "https://p/"}}, {"py": ["get x"]})[1]["OPENCODE_CONFIG_CONTENT"])["permission"] == {"py_*": "deny", "py_get_x": "allow"}
     assert reads_only("A=1 sed -n 1,5p f && echo --- && head f") and reads_only("find . -name '*.py' | wc -l")
     assert not any(reads_only(c) for c in ("sed -i s/a/b/ f", "cat a > b", "npm test", "find . -delete", "echo hi", "python - <<EOF", "cat $(ls)", "git commit -m x"))
-    assert nudge(EXPLORE_BUDGET + 1, 0).startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1}") and nudge(9, 1) == "" and nudge(EXPLORE_BUDGET, 0) == ""
+    assert nudge(EXPLORE_BUDGET + 1, 0, 0).startswith(f"frugal: the last prompt ran {EXPLORE_BUDGET + 1} reads") and nudge(9, 20, 1) == "" and nudge(EXPLORE_BUDGET, SHELL_BUDGET, 0) == ""
+    assert nudge(0, SHELL_BUDGET + 1, 0).startswith(f"frugal: the last prompt ran {SHELL_BUDGET + 1} shell commands here")
     # Duplicate OAuth entries: refresh the newest login and preserve the stale entry and concurrent changes.
     saved_cfg, saved_refresh = os.environ.get("CLAUDE_CONFIG_DIR"), refresh_token
     try:
