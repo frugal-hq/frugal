@@ -63,7 +63,7 @@ Other Claude logins, Codex, Grok, Gemini, and OpenCode can take the bounded work
 | `add claude <id>` | Its own config in `~/.claude-<id>`, so it never touches the main login |
 | `add codex <id>` | The Codex login on this machine |
 | `add grok <id>` | A Grok login |
-| `add gemini <id> [--paid]` | An API key on stdin, never argv; `--paid` only with billing on, since free-tier keys may train on your data |
+| `add gemini <id> [--google] [--paid]` | An API key on stdin, never argv; `--paid` only with billing on, since free-tier keys may train on your data; `--google` signs in with a Google account instead of a key (login opens gemini; pick Login with Google, then /quit) |
 | `add opencode <id> <provider/model>` | Free models need no login |
 
 `add` installs a missing CLI with `npm install -g` when Node.js is on the PATH, and a second Codex or Grok account gets its own home in `~/.frugal/<kind>-<id>`. `status <id>` and `login-command <id>` print JSON, which Frugal Deck uses to add and sign in every account kind.
