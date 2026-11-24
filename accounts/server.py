@@ -418,7 +418,9 @@ def choose(a, kind, level=None, effort=None):
     return model, fit(effort or base, rule["efforts"])
 
 
-STRONG = {"claude": 0, "codex": 1, "grok": 2, "gemini": 3}  # heavy and max: Claude, Codex, Grok, then Gemini; free OpenCode models never
+# heavy and max: Codex, Grok, Claude, then Gemini, idle accounts first; free OpenCode models never.
+# 2026-11-24: Claude ranked first took 22 of 30 heavy jobs and hit its 5-hour limit; busy Codex kept Grok idle.
+STRONG = {"codex": 0, "grok": 1, "claude": 2, "gemini": 3}
 
 
 def order(accounts, busy, level=None):
@@ -429,8 +431,10 @@ def order(accounts, busy, level=None):
     # jobs.jsonl 2026-11-08..22: Grok averaged ~375k tokens per search against ~44k for Codex and ~130k for OpenCode,
     # and was the only paid delegate ($18.36 in 43 jobs).
     # frugal: rank by measured tokens per kind from jobs.jsonl when more kinds are paid.
-    rank = (lambda a: STRONG[a["kind"]]) if level in ("heavy", "max") else (lambda a: a.get("kind") == "grok")
-    return sorted(pool, key=lambda a: (rank(a), busy.get(a["id"], 0) * 1000 + (a.get("used", 0) if a.get("day") == day else 0)))
+    used = lambda a: a.get("used", 0) if a.get("day") == day else 0
+    if level in ("heavy", "max"):
+        return sorted(pool, key=lambda a: (busy.get(a["id"], 0), STRONG[a["kind"]], used(a)))
+    return sorted(pool, key=lambda a: (a.get("kind") == "grok", busy.get(a["id"], 0) * 1000 + used(a)))
 
 
 def limit_until(text, now=None):
@@ -1549,7 +1553,8 @@ def selftest():
     assert limit_until("resets 12pm", base) == datetime.datetime(2026, 11, 24, 12, 0).timestamp() and limit_until("quota", base) == base + HOUR
     assert [a["id"] for a in order(pool, {"old": 1})] == ["b", "a", "old"]
     mixed = [{"id": "o", "kind": "opencode"}, {"id": "g", "kind": "grok"}, {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude", "used": 9, "day": today()}]
-    assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["c", "x", "g"] and order(mixed, {}, "standard")[0]["id"] == "o"
+    assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["x", "g", "c"] and order(mixed, {}, "standard")[0]["id"] == "o"
+    assert [a["id"] for a in order(mixed, {"x": 1}, "heavy")] == ["g", "c", "x"]
     mixed = [{"id": "g", "kind": "grok", "used": 0, "day": today()}, {"id": "x", "kind": "codex", "used": 5, "day": today()}]
     assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "x"
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
@@ -2039,8 +2044,8 @@ def selftest():
         assert brief("look", "search", None, "standard", None, ".").startswith("Done by x") and [t[0] for t in tries] == ["opencode", "codex"], tries
         tries.clear()
         job, replies[:] = {}, [(124, "", "timed out"), (1, "", "boom"), (0, "ok", "")]
-        assert brief("big", "search", None, "standard", None, ".", job=job).startswith("Done by x"), tries
-        assert tries == [("opencode", 600), ("claude", 1200), ("codex", 1200)] and [f["exit"] for f in job["failures"]] == [124, 1], (tries, job)
+        assert brief("big", "search", None, "standard", None, ".", job=job).startswith("Done by c"), tries
+        assert tries == [("opencode", 600), ("codex", 1200), ("claude", 1200)] and [f["exit"] for f in job["failures"]] == [124, 1], (tries, job)
         # A check that fails the same way after two accounts' work stops there and names what they left in the tree.
         tries.clear()
         replies[:] = [(0, "ok", "")] * 4
