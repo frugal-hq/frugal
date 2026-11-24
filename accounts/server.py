@@ -111,7 +111,10 @@ def file_lock():
     finally:
         if fd is not None:
             os.close(fd)
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:  # Windows: another process judged the lock stale and holds a new one; it removes its own
+                pass
 
 
 def save(data):
