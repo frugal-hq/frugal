@@ -5,7 +5,7 @@ One file, stdlib only, four roles:
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
-  server.py list | add <claude|codex|grok> <id> | add gemini <id> [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
+  server.py list | add <claude|codex|grok> <id> | add gemini <id> [--google] [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
 """
 import concurrent.futures, contextlib, datetime, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
@@ -500,7 +500,7 @@ def why_none(data, servers, level, now=None):
 
 
 def training_message(a):
-    return ("its key is on the free tier and may train on your data (opencode-training on; re-add with --paid if billing is on)"
+    return ("it is on Gemini's free tier and may train on your data (opencode-training on; re-add with --paid if billing or a paid Google plan is on)"
             if a["kind"] == "gemini" else "its model may train on your data (opencode-training on)")
 
 
@@ -1333,9 +1333,9 @@ def child_env(a, extra=None):
     # The main account uses the default folder, so its delegate drops the CLAUDE_CONFIG_DIR this session may run with.
     env = {**os.environ, **(extra or {}), **account_env(a)}
     if a.get("kind") == "gemini":
-        env.pop("GEMINI_API_KEY", None)  # never use the parent's key
+        env.pop("GEMINI_API_KEY", None)  # never use the parent's key, nor a stale one in a Google account
         try:
-            if key := re.search(r"^GEMINI_API_KEY=(.+)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M):
+            if a.get("auth") != "google" and (key := re.search(r"^GEMINI_API_KEY=(.+)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)):
                 env["GEMINI_API_KEY"] = key[1]
         except (OSError, ValueError):
             pass
@@ -1359,6 +1359,10 @@ def read_json(path):
 
 def logged_in(a):
     """(signed in, email or None). Grok and OpenCode keep their login in auth.json, which grok logout leaves as {}."""
+    if a["kind"] == "gemini" and a.get("auth") == "google":
+        home = Path(a["home"]) / ".gemini"
+        accounts = read_json(home / "google_accounts.json")
+        return bool(read_json(home / "oauth_creds.json")), accounts.get("active") if isinstance(accounts, dict) else None
     if a["kind"] == "gemini":
         try:
             return bool(re.search(r"^GEMINI_API_KEY=.+$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)), None
@@ -1381,8 +1385,8 @@ def logged_in(a):
 
 
 def login_command(a):
-    argv = None if a["kind"] == "gemini" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or blocked(a, {})) else {
-        "claude": ["claude", "auth", "login"], "codex": ["codex", "login"], "grok": ["grok", "login"], "opencode": ["opencode", "auth", "login"]}[a["kind"]]
+    argv = None if a["kind"] == "gemini" and a.get("auth") != "google" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or blocked(a, {})) else {
+        "claude": ["claude", "auth", "login"], "codex": ["codex", "login"], "grok": ["grok", "login"], "opencode": ["opencode", "auth", "login"], "gemini": ["gemini"]}[a["kind"]]
     return {"argv": argv, "env": account_env(a)}
 
 
@@ -1425,7 +1429,7 @@ def cli(args):
                 + (", at its limit" if a.get("exhausted_until", 0) > time.time() else "")
                 + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
-        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add gemini <id> [--paid] | add opencode <id> <provider/model>"
+        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add gemini <id> [--google] [--paid] | add opencode <id> <provider/model>"
     if args[0] in ("status", "login-command") and len(args) == 2:
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
@@ -1436,7 +1440,7 @@ def cli(args):
         if ok and a.pop("needs_login", None):
             save(data)  # Deck signs in in its own terminal; status puts that account back in the pool.
         return json.dumps({"id": a["id"], "kind": a["kind"], "installed": bool(shutil.which(a["kind"])), "loggedIn": ok})
-    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] == "gemini" and args[3:] == ["--paid"]):
+    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] == "gemini" and sorted(args[3:]) in (["--paid"], ["--google"], ["--google", "--paid"])):
         kind, aid = args[1], args[2]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", aid):
             raise SystemExit("Account id must contain only letters, numbers, underscores or hyphens.")
@@ -1464,6 +1468,13 @@ def cli(args):
                 Path(a["home"]).mkdir(parents=True, exist_ok=True)
             if kind == "codex":
                 a["models"] = codex_models(a)
+        elif kind == "gemini" and "--google" in args:
+            a["home"], a["paid"], a["auth"], a["needs_login"] = str(DIR / f"gemini-{aid}"), "--paid" in args, "google", True
+            path = Path(a["home"]) / ".gemini" / "settings.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            settings = read_json(path) or {}
+            settings.setdefault("security", {}).setdefault("auth", {})["selectedType"] = "oauth-personal"
+            path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
         elif kind == "gemini":
             key = sys.stdin.readline().rstrip("\r\n")
             if not key or not key.isprintable() or any(c.isspace() for c in key):
@@ -1626,6 +1637,22 @@ def selftest():
                 assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=paid-test-key\n"
             key_file.write_text("GEMINI_API_KEY=\n", encoding="utf-8")
             assert logged_in(gemini) == (False, None)
+            sys.stdin = io.StringIO("")
+            cli(["add", "gemini", "gg", "--google"])
+            gg = load()["accounts"][-1]
+            assert gg["id"] == "gg" and gg["auth"] == "google" and gg["needs_login"]
+            google = DIR / "gemini-gg" / ".gemini"
+            assert read_json(google / "settings.json")["security"]["auth"]["selectedType"] == "oauth-personal"
+            assert logged_in(gg) == (False, None) and login_command(gg)["argv"] == ["gemini"]
+            (google / "oauth_creds.json").write_text('{"refresh_token":"r"}', encoding="utf-8")
+            (google / "google_accounts.json").write_text('{"active":"a@b.c","old":[]}', encoding="utf-8")
+            assert logged_in(gg) == (True, "a@b.c")
+            try:
+                cli(["add", "gemini", "gx", "--paid", "--paid"])
+                raise AssertionError("Repeated flag accepted")
+            except SystemExit as e:
+                assert str(e) == __doc__
+            cli(["remove", "gg"])
             for kind in ("codex", "grok"):
                 cli(["add", kind, kind + "1"])
                 cli(["add", kind, kind + "2"])
