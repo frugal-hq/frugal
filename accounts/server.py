@@ -433,7 +433,8 @@ def order(accounts, busy, level=None):
     # frugal: rank by measured tokens per kind from jobs.jsonl when more kinds are paid.
     used = lambda a: a.get("used", 0) if a.get("day") == day else 0
     if level in ("heavy", "max"):
-        return sorted(pool, key=lambda a: (busy.get(a["id"], 0), STRONG[a["kind"]], used(a)))
+        # An account that ran out of time on a heavy job today goes last: a 20-minute timeout costs more than a slower pick.
+        return sorted(pool, key=lambda a: (a.get("slow_day") == day, busy.get(a["id"], 0), STRONG[a["kind"]], used(a)))
     return sorted(pool, key=lambda a: (a.get("kind") == "grok", busy.get(a["id"], 0) * 1000 + used(a)))
 
 
@@ -859,6 +860,13 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             # A timed-out edit leaves its work in the tree: the next account would start over on top of it, so hand it back as is.
             if code == 124 and kind == "edit" and (left := sorted(f for f, t in touched(cwd).items() if before.get(f) != t)):
                 job["cause"] = "brief"
+                if level in ("heavy", "max"):
+                    with LOCK, file_lock():
+                        data = load()
+                        for x in data["accounts"]:
+                            if x["id"] == a["id"]:
+                                x["slow_day"] = today()
+                        save(data)
                 return (f"{relogin(relog)}frugal: {a['id']} timed out after changing {', '.join(left[:30])}, untested. "
                         "Review that diff here, then finish it here or delegate the rest, saying what is already done.")
         finally:
@@ -890,6 +898,8 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                                 x["errors"] = 0
                         elif code == 0:
                             x["errors"] = 0
+                        if code == 124 and level in ("heavy", "max"):
+                            x["slow_day"] = today()
                         x["used"] = (x.get("used", 0) if x.get("day") == today() else 0) + 1
                         x["day"] = today()
             save(data)
@@ -1600,6 +1610,8 @@ def selftest():
     mixed = [{"id": "o", "kind": "opencode"}, {"id": "g", "kind": "grok"}, {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude", "used": 9, "day": today()}]
     assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["x", "g", "c"] and order(mixed, {}, "standard")[0]["id"] == "o"
     assert [a["id"] for a in order(mixed, {"x": 1}, "heavy")] == ["g", "c", "x"]
+    mixed[2]["slow_day"] = today()
+    assert [a["id"] for a in order(mixed, {}, "heavy")] == ["g", "c", "x"] and order(mixed, {}, "standard")[0]["id"] == "o"
     mixed = [{"id": "g", "kind": "grok", "used": 0, "day": today()}, {"id": "x", "kind": "codex", "used": 5, "day": today()}]
     assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "x"
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
