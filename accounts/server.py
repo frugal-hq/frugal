@@ -604,10 +604,26 @@ def run_tree(cmd, timeout, input=None, **kw):
     return result
 
 
+def unshim(exe):
+    """An npm .cmd shim's target: the shim runs through cmd.exe, which stops at 8191 characters
+    (Pylon's 254 tool rules made every Claude delegate fail with "The command line is too long.", 2026-11-24)."""
+    try:
+        found = [p for p in re.findall(r'"%dp0%\\([^"]+)"', Path(exe).read_text(encoding="utf-8", errors="replace")) if p.lower() != "node.exe"]
+    except OSError:
+        return [exe]
+    if not exe.lower().endswith(".cmd") or not found:
+        return [exe]
+    target = str(Path(exe).parent / found[-1])  # a native binary, or a script for node (grok's bin/grok has no extension)
+    return [target] if target.lower().endswith(".exe") else [shutil.which("node") or "node", target]
+
+
 def run_cli(argv, prompt, cwd, env, timeout=600):
     exe = shutil.which(argv[0])  # finds npm's .cmd shims on Windows
     if not exe:
         return 127, "", f"{argv[0]} not found"
+    if os.name == "nt" and len(subprocess.list2cmdline([exe, *argv[1:]])) > 8000:
+        exe, *pre = unshim(exe)
+        argv = [argv[0], *pre, *argv[1:]]
     tmp = None
     if argv[0] == "grok":  # grok takes no prompt on stdin, and a long one overflows the command line
         fd, tmp = tempfile.mkstemp(suffix=".md")
