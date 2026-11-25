@@ -492,7 +492,7 @@ def why_none(data, servers, level, now=None):
         if own(a) or servers and a["kind"] == "gemini" or any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers):
             continue
         state = ("off" if not a.get("enabled", True) else "logged out" if a.get("needs_login")
-                 else f"at its limit until {time.strftime('%H:%M', time.localtime(a['exhausted_until']))}" if a.get("exhausted_until", 0) > now
+                 else f"{'benched for errors' if a.get('bench_reason') == 'errors' else 'at its limit'} until {time.strftime('%H:%M', time.localtime(a['exhausted_until']))}" if a.get("exhausted_until", 0) > now
                  else "blocked" if blocked(a, data) else "too light for heavy work" if level in ("heavy", "max") and a["kind"] not in STRONG else "")
         if state:
             states.append(f"{name(a['id'])} {state}")
@@ -656,7 +656,12 @@ def env_failure(code, out):
     return code in (124, 126, 127) or (code != 0 and bool(ENV_FAIL.search(out)))
 
 
-def do_here(check, code, out):
+def do_here(check, code, out, job):
+    if code == 124:  # it ran and was stopped at its limit: "could not run here" sent a 30-minute scraper back as missing tools (2026-11-24)
+        job["cause"] = "brief"
+        return (f"frugal: check `{check}` {out} and was stopped, unfinished. A command that long: run it here in the background, "
+                "or split it into shorter runs.")
+    job["cause"] = "env"
     return (f"frugal: check `{check}` exited {code} and could not run here:\n{out[-800:]}\n"
             "Do it here: run the same command in your shell. If it fails the same way there, the tool is missing or not running "
             "on this machine (start or install it); the code was not tested.")
@@ -666,12 +671,13 @@ def run_brief(text, check, level, effort, cwd, job):
     # The check runs once, here; its exit code and output are the result. An agent only explains a failure, from that output.
     code, out = run_check(check, cwd, TIMEOUT.get(level, 600))  # a data build ran past the old fixed 5 minutes and came back to the chat
     if env_failure(code, out):
-        return do_here(check, code, out)
+        return do_here(check, code, out, job)
     if code == 0:
         return f"frugal: check `{check}` exited 0, passed:\n{out[-300:]}"
     notes = brief(f"{text}\n\nThe command `{check}` already ran and exited {code}. The end of its output:\n{out[-8000:]}\n\n"
                   "Find the cause of each failure from this output and the code. Do not run the command again, and do not change any file.",
                   "search", None, level, effort, cwd, job=job)
+    job["cause"] = "code" if CHECK_ERROR.search(out) else "brief"
     reason = f"check `{check}` exited {code}: {out[-400:]}"
     if not CHECK_ERROR.search(out):
         reason += " (no error in the output: a silent part such as test, grep -q or git diff --quiet failed)"
@@ -745,9 +751,10 @@ def relogin(ids):
     return "".join(f"frugal: secondary account {name(i)} is logged out; tell the user to run `/frugal:accounts login {i}`.\n" for i in ids)
 
 
-def failed_try(job, a, model, code, began, reason):
+def failed_try(job, a, model, code, began, reason, cause):
     # Every try's reason, for Frugal Deck's Failed tasks; the reply names only the last one.
-    job.setdefault("failures", []).append({"account": a["id"], "model": model, "exit": code, "seconds": round(time.time() - began), "reason": reason[-300:]})
+    job.setdefault("failures", []).append({"account": a["id"], "model": model, "exit": code, "seconds": round(time.time() - began), "reason": reason[-300:], "cause": cause})
+    job["cause"] = cause
 
 
 def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
@@ -766,6 +773,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         return f"frugal: this session's login to {', '.join(expired)} expired; call one of its tools here once to refresh it, then delegate again."
     allow, deny, failed, ro = mcp_rules(servers, cwd)
     if failed:
+        job["cause"] = "frugal"
         return f"frugal: could not list the tools of {', '.join(failed)} to keep the delegate read-only. Do it here."
     if level not in LEVELS and kind == "edit" and len(text) > 2500:
         level = "heavy"  # a long edit brief is multi-file work: on the standard level it ran past 10 minutes and started over
@@ -834,6 +842,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             code, out, err = run_cli(argv_for(a, kind, model, eff, off, mcp_file, allow, deny, mcp_args), prompt, cwd, env, TIMEOUT.get(level, 600))
             # A timed-out edit leaves its work in the tree: the next account would start over on top of it, so hand it back as is.
             if code == 124 and kind == "edit" and (left := sorted(f for f, t in touched(cwd).items() if before.get(f) != t)):
+                job["cause"] = "brief"
                 return (f"{relogin(relog)}frugal: {a['id']} timed out after changing {', '.join(left[:30])}, untested. "
                         "Review that diff here, then finish it here or delegate the rest, saying what is already done.")
         finally:
@@ -851,6 +860,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                         relog.append(a["id"])
                     elif code != 0 and LIMIT.search(out + err):
                         x["exhausted_until"] = limit_until(out + err)
+                        x["bench_reason"] = "limit"
                     else:
                         # GLM and crouton OpenCode models failed 33 times in two weeks with the same "Unexpected server error",
                         # each retried every task. Only the same error counts, ids and timestamps aside: one network blip never benches.
@@ -860,6 +870,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                             x["errors"], x["errors_day"], x["error_sig"] = (x.get("errors", 0) if same else 0) + 1, today(), sig
                             if x["errors"] >= 3:
                                 x["exhausted_until"] = time.time() + 6 * HOUR
+                                x["bench_reason"] = "errors"
                                 x["errors"] = 0
                         elif code == 0:
                             x["errors"] = 0
@@ -870,7 +881,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         label = f"{name(a['id'])} ({', '.join(filter(None, [model, f'{eff} effort' if eff else None]))})"
         if code != 0 or not out:
             failure = (err or out or f"exit {code}")[-400:]
-            failed_try(job, a, model, code, began, failure)
+            failed_try(job, a, model, code, began, failure, "brief" if code == 124 else "account")
             failed_kinds.add(a["kind"])
             if code == 124 and level not in ("heavy", "max"):
                 level = "heavy"  # bigger than its level: the next try gets a strong account and 20 minutes instead of another 10
@@ -878,7 +889,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         if check:
             c, tail = run_check(check, cwd)
             if env_failure(c, tail):
-                return f"{notice}{do_here(check, c, tail)}\n\nChanges by {label}, untested:\n{out[:2000]}"
+                return f"{notice}{do_here(check, c, tail, job)}\n\nChanges by {label}, untested:\n{out[:2000]}"
             if c != 0:
                 failure = f"check `{check}` exited {c}: {tail[-400:]}"
                 if not CHECK_ERROR.search(tail):
@@ -888,11 +899,12 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 if left:
                     failure += (f" Its changes are still in the tree ({', '.join(left[:30])}): review and keep them, "
                                 "finish only what the check still needs, and never revert them.")
-                failed_try(job, a, model, code, began, failure)
+                failed_try(job, a, model, code, began, failure, "code" if CHECK_ERROR.search(tail) else "brief")
                 failed_kinds.add(a["kind"])
                 if check_failure in check_fails:
                     # The same check output after two accounts' work: the check itself fails, another try only redoes it.
                     # Said in the reply, or the chat redid the work here against the same check (2026-11-23, 334K tokens).
+                    job["cause"] = "brief"
                     failure = f"two accounts' work failed the check the same way; fix the check or the brief before redoing it: {failure}"
                     break
                 check_fails.add(check_failure)
@@ -945,7 +957,7 @@ def outcome(text, job):
         return "failed"
     if re.search(r"^(Done by |frugal: check `.*` exited 0, passed)", text, re.M):
         return "done"
-    return "failed" if job.get("account") else "not delegated"
+    return "failed" if job.get("account") or job.get("cause") else "not delegated"  # a run check that failed here has a cause, no account
 
 
 def run_job(b, args, cwd):
@@ -962,7 +974,12 @@ def run_job(b, args, cwd):
     finally:
         TL.job = None
         status = "cancelled" if req and req.cancelled else outcome(text, job) if text else "failed"
-        log_job({**job, "status": status, "end": time.time(), "result": (text or "")[:300]})
+        entry = {**job, "status": status, "end": time.time(), "result": (text or "")[:300]}
+        if status == "failed":
+            entry["cause"] = job.get("cause") or "frugal"
+        else:
+            entry.pop("cause", None)  # done after a failed try is not a failure
+        log_job(entry)
 
 
 def work_dir(args):
@@ -1427,7 +1444,7 @@ def cli(args):
     data = load()
     if args[:1] == ["list"] or not args:
         rows = [f"{a['id']}: {a['kind']}{f" {a['model']}" if a.get('model') else ''}{' (off)' if not a.get('enabled', True) else ''}, used today {a.get('used', 0) if a.get('day') == today() else 0}"
-                + (", at its limit" if a.get("exhausted_until", 0) > time.time() else "")
+                + ((", benched for errors" if a.get("bench_reason") == "errors" else ", at its limit") if a.get("exhausted_until", 0) > time.time() else "")
                 + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
         return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add gemini <id> [--google] [--paid] | add opencode <id> <provider/model>"
@@ -2074,6 +2091,7 @@ def selftest():
         job, replies[:] = {}, [(124, "", "timed out"), (1, "", "boom"), (0, "ok", "")]
         assert brief("big", "search", None, "standard", None, ".", job=job).startswith("Done by c"), tries
         assert tries == [("opencode", 600), ("codex", 1200), ("claude", 1200)] and [f["exit"] for f in job["failures"]] == [124, 1], (tries, job)
+        assert job["cause"] == "account", job
         # A check that fails the same way after two accounts' work stops there and names what they left in the tree.
         tries.clear()
         replies[:] = [(0, "ok", "")] * 4
@@ -2105,6 +2123,7 @@ def selftest():
             if code == 1 and errors == 0:
                 assert began + 6 * HOUR <= accounts[0]["exhausted_until"] <= time.time() + 6 * HOUR, accounts
                 assert not ready(accounts), accounts
+                assert accounts[0]["bench_reason"] == "errors", accounts
             else:
                 assert "exhausted_until" not in accounts[0], accounts
     finally:
