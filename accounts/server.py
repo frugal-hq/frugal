@@ -1269,13 +1269,17 @@ def gate(event):
     sid, tool, inp = event.get("session_id", ""), event.get("tool_name", ""), event.get("tool_input") or {}
     s = read_state(sid)
     reason = note = None
-    # A denied read is repeated with the whole context re-read, so past the budget a read still runs and only gets a note.
+    # A denied read is repeated with the whole context re-read, so past the budget a read gets a note, and only one denial at
+    # 3x when nothing was delegated, since sessions ignored the note.
     def count_read():
-        nonlocal note
+        nonlocal note, reason
         s["reads"] = s.get("reads", 0) + 1
         if s["reads"] == EXPLORE_BUDGET + 1:
             note = (f"frugal: {EXPLORE_BUDGET} reads and searches this prompt already. Hand the rest of this exploration to {TOOL} "
                     "(kind \"search\", pieces in \"tasks\") and work from its summary.")
+        if s["reads"] == 3 * EXPLORE_BUDGET + 1 and not s.get("delegated"):
+            reason = (f"frugal: {3 * EXPLORE_BUDGET} reads and searches here this prompt and none delegated. Send the rest of this exploration to {TOOL} "
+                      "(kind \"search\", pieces in \"tasks\") and work from its summary. If it needs this conversation's context, repeat this call and it goes through.")
     if tool in ("Bash", "PowerShell"):
         cmd = inp.get("command", "")
         # A background launch costs nothing while it runs; delegate would block on it and end it at its timeout.
@@ -1291,6 +1295,9 @@ def gate(event):
             if s["shell"] == SHELL_BUDGET + 1 and not s.get("delegated"):
                 note = (f"frugal: {SHELL_BUDGET} shell commands here this prompt already. Send bounded runs to {TOOL} (kind \"run\", the command as \"check\") "
                         "and scripted changes as kind \"edit\"; keep here only what needs this conversation's judgment.")
+            if s["shell"] == 2 * SHELL_BUDGET + 1 and not s.get("delegated"):
+                reason = (f"frugal: {2 * SHELL_BUDGET} shell commands here this prompt and none delegated. Send bounded runs to {TOOL} (kind \"run\", the command as \"check\") "
+                          "and scripted changes as kind \"edit\". If this one needs this conversation's judgment, repeat it and it goes through.")
     elif tool in ("Read", "Grep", "Glob"):
         count_read()
     elif tool in EDITS and not OWN_FILE.search(inp.get("file_path") or inp.get("notebook_path") or ""):
@@ -1926,6 +1933,16 @@ def selftest():
         ag = {"session_id": sid, "tool_name": "Agent", "tool_input": {"prompt": "p"}}
         assert '"mcp"' in gate(ag)[0] and "third time" in gate(ag)[0] and gate(ag) == (None, None)
         assert delegate({"kind": "edit"}).startswith('frugal: put the brief in "task"')
+        # reads and shell commands: one denial far past the budget, and never after this prompt delegated
+        for sid, key, limit, kind, call in (("selftest-reads", "reads", 3 * EXPLORE_BUDGET, "search", {"tool_name": "Read", "tool_input": {"file_path": "a"}}),
+                                            ("selftest-shell", "shell", 2 * SHELL_BUDGET, "run", {"tool_name": "Bash", "tool_input": {"command": "python x.py"}})):
+            state(sid).write_text(json.dumps({key: 0}), encoding="utf-8")
+            ev = {"session_id": sid, **call}
+            assert all(gate(ev)[0] is None for _ in range(limit)) and f'kind "{kind}"' in gate(ev)[0] and gate(ev)[0] is None
+            state(sid).write_text(json.dumps({key: limit, "delegated": 1}), encoding="utf-8")
+            assert gate(ev)[0] is None
+            state(sid).unlink()
+        sid = "selftest-edits"  # the one the cleanup below removes
     finally:
         globals()["active"] = was_active
         state(sid).unlink(missing_ok=True)
