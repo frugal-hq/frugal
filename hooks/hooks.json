@@ -37,6 +37,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c '[ -z \"$FRUGAL_DELEGATED\" ] || exit 0; exec python \"$1\" hook-gate' sh \"${CLAUDE_PLUGIN_ROOT}/accounts/server.py\"",
+            "timeout": 900
+          }
+        ]
       }
     ],
     "Stop": [

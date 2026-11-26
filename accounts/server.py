@@ -6,10 +6,15 @@ One file, stdlib only, four roles:
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
   server.py list | add <claude|codex|grok> <id> | add gemini <id> [--google] [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
+  server.py hook-gate       PreToolUse: wait for a free shell slot and RAM under the performance mode (no accounts required)
+  server.py perf status | set <mode> | profile | reap [--kill]
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
+Performance modes are separate: they apply with no accounts, from ~/.frugal/performance.json (missing means balanced).
 """
 import concurrent.futures, contextlib, datetime, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
 from pathlib import Path
+
+import perf
 
 HOME = Path.home()
 DIR = HOME / ".frugal"
@@ -1142,15 +1147,42 @@ def read_state(sid):
         return {}
 
 
+OPENCODE_TIP = "frugal: free OpenCode models need no login and can take light delegated work; offer the user: /frugal:accounts add opencode"
+
+
+def opencode_tip():
+    """One line, at most every 7 days, when Deck is not installed and no OpenCode account exists. hook-prompt's shell gate is unchanged."""
+    if perf.deck_installed() or any(a.get("kind") == "opencode" for a in load().get("accounts") or []):
+        return ""
+    stamp = DIR / "opencode-tip"
+    try:
+        if time.time() - stamp.stat().st_mtime < 7 * 86400:
+            return ""
+    except OSError:
+        pass
+    with file_lock():
+        try:
+            if time.time() - stamp.stat().st_mtime < 7 * 86400:
+                return ""
+        except OSError:
+            pass
+        try:
+            DIR.mkdir(exist_ok=True)
+            stamp.write_text(str(int(time.time())), encoding="utf-8")
+        except OSError:
+            return ""
+    return OPENCODE_TIP
+
+
 def hook_prompt(event):
     if os.environ.get(DELEGATED):
         return ""
     if (m := re.match(r"\s*/frugal:heads-up\b(.*)", event.get("prompt", ""), re.S)):
         return heads_up_set(event.get("session_id", ""), m.group(1))
     warn = relogin(a["id"] for a in load()["accounts"] if a.get("needs_login")).strip()
-    if not active():
-        return warn
-    return f"{rule(event)} {warn}".strip()
+    tip = opencode_tip()
+    parts = [warn, tip] if not active() else [rule(event), warn, tip]
+    return " ".join(p for p in parts if p)
 
 
 def prune():
@@ -1570,6 +1602,7 @@ def cli(args):
 
 
 def selftest():
+    perf.selftest()
     claude = {"id": "c", "kind": "claude"}
     codex = {"id": "x", "kind": "codex", "models": ["gpt-6-luna", "gpt-6.1-sol"]}
     assert choose(claude, "search") == ("sonnet", "medium")
@@ -2174,13 +2207,24 @@ if __name__ == "__main__":
         os.environ["LANG"] = "C.UTF-8"  # bash -c skips the profile that sets it; grep -P then fails on every check
     cmd = sys.argv[1:]
     if not cmd:
-        serve()
+        # The job lives only for this stdio process. selftest calls serve() in-process and must not cap the chat.
+        held = perf.guard(os.environ.get("FRUGAL_DECK"))
+        try:
+            serve()
+        finally:
+            perf.release(held)
     elif cmd[0] == "hook-stop":
         if (note := hook_stop(json.loads(sys.stdin.read() or "{}"))):
             # asyncRewake: exit 2 wakes Claude with stderr, so the note reaches the user while the session is idle
             print("frugal heads-up, from a side agent that read this session. Show it to the user as one line starting with "
                   f"\"Heads up:\" in their language, then stop; do not act on it unless they ask.\nNote: {note}", file=sys.stderr)
             sys.exit(2)
+    elif cmd[0] == "hook-gate":
+        sys.stdin.read()
+        if not os.environ.get(DELEGATED) and (text := perf.hook_gate()):
+            print(text)
+    elif cmd[0] == "perf":
+        print(perf.main(cmd[1:]), flush=True)
     elif cmd[0] in ("hook-prompt", "hook-pretool"):
         event = json.loads(sys.stdin.read() or "{}")
         if cmd[0] == "hook-prompt":
