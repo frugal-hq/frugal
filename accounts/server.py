@@ -716,6 +716,8 @@ def cli_reply(agent, out, err, job):
         if agent == "grok":  # --output-format json
             j = json.loads(out)
             add((j.get("usage") or {}).get("total_tokens"), j.get("total_cost_usd"))
+            if used_models := j.get("modelUsage"):  # keyed by model id; subagents add rows, so the one with most calls ran the task
+                job["model"] = max(used_models, key=lambda m: used_models[m].get("modelCalls") or 0)
             return j.get("text") or "", err or ("" if j.get("text") else out)
         if agent == "gemini":  # JsonFormatter: {session_id, response, stats, error?, warnings?}
             j = json.loads(out)
@@ -875,6 +877,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             if mcp_file:
                 os.unlink(mcp_file)
         out, err = cli_reply(a["kind"], out, err, job)
+        model = job.get("model")  # grok names its model only in its output
         with LOCK, file_lock():
             data = load()
             for x in data["accounts"]:
@@ -1965,6 +1968,10 @@ def selftest():
         # each CLI's usage: tokens and cost add up across tries, the reply is the bare answer
         job = {}
         assert cli_reply("grok", json.dumps({"text": "ok", "usage": {"total_tokens": 100}, "total_cost_usd": 0.5}), "", job) == ("ok", "")
+        assert "model" not in job
+        ran = {"model": None}
+        cli_reply("grok", json.dumps({"text": "ok", "modelUsage": {"fake-side": {"modelCalls": 1}, "fake-main": {"modelCalls": 3}}}), "", ran)
+        assert ran["model"] == "fake-main"
         oc = "\n".join(json.dumps(e) for e in [{"type": "text", "part": {"type": "text", "text": "ok"}},
                                                {"type": "step_finish", "part": {"type": "step-finish", "tokens": {"total": 20}, "cost": 0}}])
         log = "codex\nok\ntokens used\n11,590\nERROR x"
