@@ -1,11 +1,11 @@
-"""frugal accounts: secondary Claude, Codex, Grok, Gemini and OpenCode logins that take delegated work.
+"""frugal accounts: secondary Claude, Codex, Grok, Antigravity, Gemini and OpenCode logins that take delegated work.
 
 One file, stdlib only, four roles:
   server.py                 MCP server (stdio) exposing `delegate` while an account is set up
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
-  server.py list | add <claude|codex|grok> <id> | add gemini <id> [--google] [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
+  server.py list | add <claude|codex|grok> <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
   server.py hook-gate       PreToolUse: wait for a free shell slot and RAM under the performance mode (no accounts required)
   server.py perf status | set <mode> | profile | reap [--kill]
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
@@ -37,17 +37,24 @@ RULES = {
              "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "xhigh")}},
     "gemini": {"efforts": [],
                "levels": {"light": ("flash-lite", None), "standard": ("flash", None), "heavy": ("pro", None), "max": ("pro", None)}},
+    # Antigravity (agy) names the effort in the model id: gemini-<version>-<name>-<effort>; max falls back to high.
+    "antigravity": {"efforts": [],
+                    "levels": {"light": ("flash-low", None), "standard": ("flash-medium", None), "heavy": ("high", None), "max": ("xhigh", None)}},
     # OpenCode runs the one model its account names; --variant is per provider, and one a model lacks is ignored.
     "opencode": {"efforts": ["low", "medium", "high"],
                  "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "high")}},
 }
 PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "grok": "@xai-official/grok",
-            "opencode": "opencode-ai", "gemini": "@google/gemini-cli"}
+            "opencode": "opencode-ai", "gemini": "@google/gemini-cli", "antigravity": "the Antigravity CLI"}
+# Antigravity's CLI is not on npm (verified with agy 1.5.18).
+AGY_INSTALL = (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://antigravity.google/cli/install.ps1 | iex"] if os.name == "nt"
+               else ["bash", "-c", "curl -fsSL https://antigravity.google/cli/install.sh | bash"])
 DEFAULT_LEVEL = {"search": "standard", "run": "standard", "edit": "standard", "note": "light"}  # light (haiku, low) missed most of a 5-question lookup; pass level "light" only for trivial greps. A heads-up note is one judgment, which haiku makes as well as sonnet
 LIMIT = re.compile(r"usage limit|rate limit|limit reached|session limit|hit your [\w-]+ limit|quota|too many requests|\b429\b", re.I)
 # A logged-out account fails every task until the user signs in again, so it leaves the pool and the user is told.
 AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oauth token (has )?(expired|been revoked)"
-                  r"|invalid (api|x-api) key|api key not valid|authentication_error|not authenticated|not signed in|login required", re.I)
+                  r"|invalid (api|x-api) key|api key not valid|authentication_error|not authenticated|not signed in|login required"
+                  r"|authentication required|no longer supported for Gemini Code Assist|IneligibleTier", re.I)  # the last two: Gemini CLI with a personal Google login, ended 2026-06-18
 HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|(?<![.\w-])(pytest|jest|vitest|tsc|gradlew|mvn)(\.(bat|cmd|exe))?(?![.\w/-])|(?<![.\w/\\-])gradle(?![.\w/-])|\bpython\S*\s+\S*bench\.py\b"
                        r"|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b", re.I)
 SCRATCH_RULE = " Put scratch files (prompts, notes, intermediate data) in the system temp folder, never in the working directory."
@@ -419,14 +426,18 @@ def choose(a, kind, level=None, effort=None):
                     key=lambda slug: tuple(map(int, slug.split("-")[1].split("."))), default=None)
     if a["kind"] == "gemini":
         model = next((slug for slug in gemini_models() if re.fullmatch(rf"gemini-[\d.]+-{model}", slug)), "auto") if model != "pro" else "auto"
+    if a["kind"] == "antigravity":
+        name = "flash" if model.startswith("flash") else "(?!flash)[a-z]+"
+        tiers = [model.removeprefix("flash-")] + (["high"] if model == "xhigh" else [])
+        model = next((m for t in tiers for m in agy_models(a) if re.fullmatch(rf"gemini-[\d.]+-{name}-{t}", m)), None)
     if a["kind"] == "opencode":
         model = a["model"]
     return model, fit(effort or base, rule["efforts"])
 
 
-# heavy and max: Codex, Grok, Claude, then Gemini, idle accounts first; free OpenCode models never.
+# heavy and max: Codex, Grok, Claude, Antigravity, then Gemini, idle accounts first; free OpenCode models never.
 # 2026-11-24: Claude ranked first took 22 of 30 heavy jobs and hit its 5-hour limit; busy Codex kept Grok idle.
-STRONG = {"codex": 0, "grok": 1, "claude": 2, "gemini": 3}
+STRONG = {"codex": 0, "grok": 1, "claude": 2, "antigravity": 3, "gemini": 4}
 
 
 def order(accounts, busy, level=None):
@@ -475,6 +486,20 @@ def gemini_models():
     return GEMINI_MODELS
 
 
+AGY_MODELS = None
+
+
+def agy_models(a):
+    # `agy models` prints "<id>\t<label>" per line; it needs a signed-in account's env. Newest version first.
+    global AGY_MODELS
+    if AGY_MODELS is None:
+        exe = which("agy")
+        r = run_tree([exe, "models"], 60, env=child_env(a)) if exe else None
+        models = set(re.findall(r"(?m)^gemini-\d+(?:\.\d+)*-[a-z-]+(?=\s)", r[1])) if r and r[0] == 0 else set()
+        AGY_MODELS = sorted(models, key=lambda m: tuple(map(int, m.split("-")[1].split("."))), reverse=True)
+    return AGY_MODELS
+
+
 def codex_mcp(a=None):
     try:
         return set(tomllib.loads((Path(a["home"]) if a and a.get("home") else HOME / ".codex").joinpath("config.toml").read_text(encoding="utf-8")).get("mcp_servers", {}))
@@ -484,7 +509,7 @@ def codex_mcp(a=None):
 
 def blocked(a, data):
     m = (a.get("model") or "").lower()
-    return ((a["kind"] == "gemini" and not a.get("paid")
+    return ((a["kind"] in ("gemini", "antigravity") and not a.get("paid")
              or a["kind"] == "opencode" and m.startswith("opencode/") and any(t in m for t in TRAINING_MODELS))
             and not data.get("opencode_allow_training", False))
 
@@ -496,7 +521,7 @@ def why_none(data, servers, level, now=None):
     rules = [f"{n} goes only to {', '.join(['claude'] if n in only else kinds[n])} accounts" for n in servers if n in only or n in kinds]
     states = []
     for a in data["accounts"]:
-        if own(a) or servers and a["kind"] == "gemini" or any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers):
+        if own(a) or servers and a["kind"] in ("gemini", "antigravity") or any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers):
             continue
         state = ("off" if not a.get("enabled", True) else "logged out" if a.get("needs_login")
                  else f"{'benched for errors' if a.get('bench_reason') == 'errors' else 'at its limit'} until {time.strftime('%H:%M', time.localtime(a['exhausted_until']))}" if a.get("exhausted_until", 0) > now
@@ -508,13 +533,19 @@ def why_none(data, servers, level, now=None):
 
 def training_message(a):
     return ("it is on Gemini's free tier and may train on your data (opencode-training on; re-add with --paid if billing or a paid Google plan is on)"
-            if a["kind"] == "gemini" else "its model may train on your data (opencode-training on)")
+            if a["kind"] == "gemini" else "Antigravity may train on your interactions by default (opencode-training on; re-add with --paid if a paid Google plan is on)"
+            if a["kind"] == "antigravity" else "its model may train on your data (opencode-training on)")
 
 
 def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=(), mcp_args=()):
     if a["kind"] == "gemini":
         # A non-empty -p also works in nested sessions; the brief arrives on stdin, as for Claude and Codex.
         return ["gemini", "-p", "Follow the brief on stdin.", "-o", "json", "--approval-mode", "plan" if kind in ("search", "note") else "yolo", "-m", model]
+    if a["kind"] == "antigravity":
+        # Headless agy soft-denies every shell call it cannot prompt for; permissions.allow/deny rules did not stop its file-write tool
+        # (agy 1.5.18, 2026-11-26), so it always approves, and plan mode keeps search on reading, as Grok's search keeps the shell.
+        return ["agy", "-p", "Follow the brief on stdin.", "--output-format", "json", *(["--model", model] if model else []),
+                *(["--mode", "plan"] if kind in ("search", "note") else []), "--dangerously-skip-permissions"]
     if a["kind"] == "claude" and kind == "note":
         return ["claude", "-p", "--output-format", "json", "--model", model, "--effort", effort, "--tools", "", "--strict-mcp-config"]  # no tools: it only reads the brief
     if a["kind"] == "claude":
@@ -624,8 +655,17 @@ def unshim(exe):
     return [target] if target.lower().endswith(".exe") else [shutil.which("node") or "node", target]
 
 
+def which(cmd):
+    # shutil.which finds npm's .cmd shims on Windows; agy also in its install folders, as a running process misses the installer's PATH change.
+    found = shutil.which(cmd)
+    if found or cmd != "agy":
+        return found
+    local = os.environ.get("LOCALAPPDATA")
+    return next((str(p) for p in [*([Path(local) / "agy" / "bin" / "agy.exe"] if local else []), HOME / ".local" / "bin" / "agy"] if p.is_file()), None)
+
+
 def run_cli(argv, prompt, cwd, env, timeout=600):
-    exe = shutil.which(argv[0])  # finds npm's .cmd shims on Windows
+    exe = which(argv[0])
     if not exe:
         return 127, "", f"{argv[0]} not found"
     if os.name == "nt" and len(subprocess.list2cmdline([exe, *argv[1:]])) > 8000:
@@ -729,6 +769,10 @@ def cli_reply(agent, out, err, job):
             j = json.loads(out)
             add(sum((m.get("tokens") or {}).get("total") or 0 for m in ((j.get("stats") or {}).get("models") or {}).values()))
             return ("", err or (j["error"].get("message") or out)) if j.get("error") else (j.get("response") or "", err)
+        if agent == "antigravity":  # --output-format json: {status, response, error?, usage}
+            j = json.loads(out)
+            add((j.get("usage") or {}).get("total_tokens"))
+            return ("", j.get("error") or err or out) if j.get("status") == "ERROR" or j.get("error") else (j.get("response") or "", err)
         if agent == "opencode":  # --format json: one event per line
             events = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
             if not events:
@@ -814,12 +858,12 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             # A task needing a claude_only_mcp server never goes to Codex, Grok or OpenCode, nor one needing a server with an
             # mcp_kinds list to an account of another kind; a server without a list goes to any kind.
             only, kinds = data.get("claude_only_mcp", []), data.get("mcp_kinds", {})  # both set per server in Frugal Deck's MCP servers
-            pool = [a for a in order(data["accounts"], BUSY, level) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode"))
+            pool = [a for a in order(data["accounts"], BUSY, level) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode", "antigravity"))
                     and not any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers) and not blocked(a, data)]
-            if servers:  # frugal: Gemini delegates do not take MCP servers yet.
-                if pool and all(a["kind"] == "gemini" for a in pool):
-                    return "Gemini delegates do not take MCP servers yet."
-                pool = [a for a in pool if a["kind"] != "gemini"]
+            if servers:  # frugal: Gemini and Antigravity delegates do not take MCP servers yet.
+                if pool and all(a["kind"] in ("gemini", "antigravity") for a in pool):
+                    return "Gemini and Antigravity delegates do not take MCP servers yet."
+                pool = [a for a in pool if a["kind"] not in ("gemini", "antigravity")]
             if not pool:
                 break
             # After a failure another provider goes first: three free OpenCode models failed one after another on its server errors.
@@ -1411,6 +1455,8 @@ def hook_stop(event):
 
 def account_env(a):
     # OpenCode keeps its login and sessions in its own data folder per account
+    if a.get("kind") == "antigravity":  # config in <home>/.gemini/antigravity-cli, the login in a file there instead of Credential Manager
+        return {"USERPROFILE": a["home"], "HOME": a["home"], "AGY_CLI_FORCE_FILE_TOKEN_STORAGE": "1"}
     if a.get("home"):
         return {{"codex": "CODEX_HOME", "grok": "GROK_HOME", "gemini": "GEMINI_CLI_HOME"}[a["kind"]]: a["home"]}
     return {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {"XDG_DATA_HOME": a["data_dir"]} if a.get("data_dir") else {}
@@ -1420,9 +1466,9 @@ def child_env(a, extra=None):
     # The main account uses the default folder, so its delegate drops the CLAUDE_CONFIG_DIR this session may run with.
     env = {**os.environ, **(extra or {}), **account_env(a)}
     if a.get("kind") == "gemini":
-        env.pop("GEMINI_API_KEY", None)  # never use the parent's key, nor a stale one in a Google account
+        env.pop("GEMINI_API_KEY", None)  # never use the parent's key
         try:
-            if a.get("auth") != "google" and (key := re.search(r"^GEMINI_API_KEY=(.+)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)):
+            if (key := re.search(r"^GEMINI_API_KEY=(.+)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)):
                 env["GEMINI_API_KEY"] = key[1]
         except (OSError, ValueError):
             pass
@@ -1446,11 +1492,12 @@ def read_json(path):
 
 def logged_in(a):
     """(signed in, email or None). Grok and OpenCode keep their login in auth.json, which grok logout leaves as {}."""
-    if a["kind"] == "gemini" and a.get("auth") == "google":
-        home = Path(a["home"]) / ".gemini"
-        accounts = read_json(home / "google_accounts.json")
-        return bool(read_json(home / "oauth_creds.json")), accounts.get("active") if isinstance(accounts, dict) else None
-    if a["kind"] == "gemini":
+    if a["kind"] == "antigravity":
+        try:
+            return (Path(a["home"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").stat().st_size > 0, None
+        except OSError:
+            return False, None
+    if a["kind"] == "gemini":  # an API key; a Google login (ended 2026-06-18) has none, so it reads as logged out
         try:
             return bool(re.search(r"^GEMINI_API_KEY=.+$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)), None
         except OSError:
@@ -1472,8 +1519,8 @@ def logged_in(a):
 
 
 def login_command(a):
-    argv = None if a["kind"] == "gemini" and a.get("auth") != "google" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or blocked(a, {})) else {
-        "claude": ["claude", "auth", "login"], "codex": ["codex", "login"], "grok": ["grok", "login"], "opencode": ["opencode", "auth", "login"], "gemini": ["gemini"]}[a["kind"]]
+    argv = None if a["kind"] == "gemini" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or blocked(a, {})) else {
+        "claude": ["claude", "auth", "login"], "codex": ["codex", "login"], "grok": ["grok", "login"], "opencode": ["opencode", "auth", "login"], "antigravity": ["agy"]}[a["kind"]]
     return {"argv": argv, "env": account_env(a)}
 
 
@@ -1481,7 +1528,7 @@ def login(a):
     """Opens a terminal that closes when the login ends, then checks it. Blocks until then, so run it in the background."""
     command = login_command(a)
     env, argv = command["env"], command["argv"]
-    cmd = " ".join(argv or [])
+    cmd = " ".join([f'"{which(argv[0]) or argv[0]}"', *argv[1:]] if argv else [])
     if argv and os.name != "nt":
         # frugal: no terminal is opened outside Windows; run login in-process with the user's tty when one is asked for.
         return f"Run in a terminal: {' '.join(f'{k}={v}' for k, v in env.items())} {cmd}, then: login {a['id']}".strip()
@@ -1516,7 +1563,7 @@ def cli(args):
                 + ((", benched for errors" if a.get("bench_reason") == "errors" else ", at its limit") if a.get("exhausted_until", 0) > time.time() else "")
                 + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
-        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add gemini <id> [--google] [--paid] | add opencode <id> <provider/model>"
+        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model>"
     if args[0] in ("status", "login-command") and len(args) == 2:
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
@@ -1526,20 +1573,23 @@ def cli(args):
         ok = logged_in(a)[0]
         if ok and a.pop("needs_login", None):
             save(data)  # Deck signs in in its own terminal; status puts that account back in the pool.
-        return json.dumps({"id": a["id"], "kind": a["kind"], "installed": bool(shutil.which(a["kind"])), "loggedIn": ok})
-    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] == "gemini" and sorted(args[3:]) in (["--paid"], ["--google"], ["--google", "--paid"])):
+        return json.dumps({"id": a["id"], "kind": a["kind"], "installed": bool(which("agy" if a["kind"] == "antigravity" else a["kind"])), "loggedIn": ok})
+    if args[:2] == ["add", "gemini"] and "--google" in args[3:]:
+        raise SystemExit("Gemini CLI no longer serves personal Google accounts (ended 2026-06-18). Sign in with Google through Antigravity: "
+                         "add antigravity <id> [--paid]; or add a Gemini API key: add gemini <id> [--paid]")
+    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] in ("gemini", "antigravity") and args[3:] == ["--paid"]):
         kind, aid = args[1], args[2]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", aid):
             raise SystemExit("Account id must contain only letters, numbers, underscores or hyphens.")
         existing = next((a for a in data["accounts"] if a["id"] == aid), None)
         if existing and not (kind == existing["kind"] == "gemini"):
             raise SystemExit(f"{aid} is already set up.")
-        if not shutil.which(kind):
+        if not which("agy" if kind == "antigravity" else kind):
             npm = shutil.which("npm")
-            if not npm:
+            if not npm and kind != "antigravity":
                 raise SystemExit("Install Node.js (https://nodejs.org) first, then try again.")
             print(f"Installing {PACKAGES[kind]}...", flush=True)
-            r = subprocess.run([npm, "install", "-g", PACKAGES[kind]], stdin=subprocess.DEVNULL)
+            r = subprocess.run(AGY_INSTALL if kind == "antigravity" else [npm, "install", "-g", PACKAGES[kind]], stdin=subprocess.DEVNULL)
             if r.returncode:
                 raise SystemExit(r.returncode)
             data = load()
@@ -1555,13 +1605,9 @@ def cli(args):
                 Path(a["home"]).mkdir(parents=True, exist_ok=True)
             if kind == "codex":
                 a["models"] = codex_models(a)
-        elif kind == "gemini" and "--google" in args:
-            a["home"], a["paid"], a["auth"], a["needs_login"] = str(DIR / f"gemini-{aid}"), "--paid" in args, "google", True
-            path = Path(a["home"]) / ".gemini" / "settings.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            settings = read_json(path) or {}
-            settings.setdefault("security", {}).setdefault("auth", {})["selectedType"] = "oauth-personal"
-            path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        elif kind == "antigravity":
+            a["home"], a["paid"] = str(DIR / f"antigravity-{aid}"), "--paid" in args[3:]
+            Path(a["home"]).mkdir(parents=True, exist_ok=True)
         elif kind == "gemini":
             key = sys.stdin.readline().rstrip("\r\n")
             if not key or not key.isprintable() or any(c.isspace() for c in key):
@@ -1656,6 +1702,7 @@ def selftest():
     assert [a["id"] for a in order(mixed, {"x": 1}, "heavy")] == ["g", "c", "x"]
     mixed[2]["slow_day"] = today()
     assert [a["id"] for a in order(mixed, {}, "heavy")] == ["g", "c", "x"] and order(mixed, {}, "standard")[0]["id"] == "o"
+    assert [a["id"] for a in order([{"id": "gm", "kind": "gemini"}, {"id": "ag", "kind": "antigravity"}, {"id": "c", "kind": "claude"}], {}, "heavy")] == ["c", "ag", "gm"]
     mixed = [{"id": "g", "kind": "grok", "used": 0, "day": today()}, {"id": "x", "kind": "codex", "used": 5, "day": today()}]
     assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "x"
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
@@ -1678,15 +1725,15 @@ def selftest():
     # New providers and Deck commands stay isolated from the machine's accounts and keys.
     import io
     g = globals()
-    real = {k: g[k] for k in ("DIR", "FILE", "PENDING", "GEMINI_MODELS", "run_tree")}
+    real = {k: g[k] for k in ("DIR", "FILE", "PENDING", "GEMINI_MODELS", "AGY_MODELS", "run_tree")}
     saved_which, saved_run, saved_stdin = shutil.which, subprocess.run, sys.stdin
     saved_key = os.environ.get("GEMINI_API_KEY")
     try:
         with tempfile.TemporaryDirectory() as folder:
-            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[], GEMINI_MODELS=None)
+            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[], GEMINI_MODELS=None, AGY_MODELS=None)
             shutil.which = lambda name: name + ".cmd"
             calls = []
-            def models_cli(argv, timeout):
+            def models_cli(argv, timeout, **kw):
                 calls.append(argv)
                 return 0, "auto\ngemini-2.5-pro\ngemini-3.5-flash\ngemini-2.5-flash\ngemini-3.1-flash-lite\ngemini-9.0-flash-preview\n  Description: supersedes gemini-8.0-flash\n", ""
             g["run_tree"] = models_cli
@@ -1727,22 +1774,65 @@ def selftest():
                 assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=paid-test-key\n"
             key_file.write_text("GEMINI_API_KEY=\n", encoding="utf-8")
             assert logged_in(gemini) == (False, None)
-            sys.stdin = io.StringIO("")
-            cli(["add", "gemini", "gg", "--google"])
-            gg = load()["accounts"][-1]
-            assert gg["id"] == "gg" and gg["auth"] == "google" and gg["needs_login"]
-            google = DIR / "gemini-gg" / ".gemini"
-            assert read_json(google / "settings.json")["security"]["auth"]["selectedType"] == "oauth-personal"
-            assert logged_in(gg) == (False, None) and login_command(gg)["argv"] == ["gemini"]
-            (google / "oauth_creds.json").write_text('{"refresh_token":"r"}', encoding="utf-8")
-            (google / "google_accounts.json").write_text('{"active":"a@b.c","old":[]}', encoding="utf-8")
-            assert logged_in(gg) == (True, "a@b.c")
+            # Gemini's Google sign-in ended 2026-06-18: refused, and a leftover Google account reads as logged out.
             try:
-                cli(["add", "gemini", "gx", "--paid", "--paid"])
-                raise AssertionError("Repeated flag accepted")
+                cli(["add", "gemini", "gg", "--google"])
+                raise AssertionError("Gemini Google sign-in accepted")
             except SystemExit as e:
-                assert str(e) == __doc__
-            cli(["remove", "gg"])
+                assert "add antigravity" in str(e)
+            assert AUTH.search("This client is no longer supported for Gemini Code Assist for individuals") and AUTH.search("IneligibleTier")
+            leftover = {"id": "gg", "kind": "gemini", "auth": "google", "home": str(DIR / "gemini-gg")}
+            assert logged_in(leftover) == (False, None) and login_command(leftover)["argv"] is None
+            for bad in (["add", "gemini", "gx", "--paid", "--paid"], ["add", "antigravity", "ax", "--google"], ["add", "antigravity", "ax", "--paid", "x"]):
+                try:
+                    cli(bad)
+                    raise AssertionError("Bad add arguments accepted")
+                except SystemExit as e:
+                    assert str(e) == __doc__
+            cli(["add", "antigravity", "ag"])
+            ag, home = load()["accounts"][-1], str(DIR / "antigravity-ag")
+            assert ag["home"] == home and ag["needs_login"] and not ag["paid"] and Path(home).is_dir()
+            env = {"USERPROFILE": home, "HOME": home, "AGY_CLI_FORCE_FILE_TOKEN_STORAGE": "1"}
+            assert json.loads(cli(["login-command", "ag"])) == {"argv": ["agy"], "env": env} and child_env(ag)["USERPROFILE"] == home
+            token = Path(home) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+            assert logged_in(ag) == (False, None)
+            token.parent.mkdir(parents=True)
+            token.write_text("", encoding="utf-8")
+            assert logged_in(ag) == (False, None)
+            token.write_text("t", encoding="utf-8")
+            assert json.loads(cli(["status", "ag"])) == {"id": "ag", "kind": "antigravity", "installed": True, "loggedIn": True}
+            assert blocked(ag, {}) and not blocked(ag, {"opencode_allow_training": True}) and "Antigravity" in training_message(ag)
+            cli(["add", "antigravity", "agp", "--paid"])
+            assert not blocked(load()["accounts"][-1], {})
+            cli(["remove", "agp"])
+            agy_list = ("gemini-4-hydrogen-low\tH\ngemini-4-hydrogen-medium\tH\ngemini-4-hydrogen-high\tH\ngemini-4-hydrogen-xhigh\tH\n"
+                        "gemini-3.8-flash-low\tF\ngemini-3.8-flash-medium\tF\ngemini-3.8-flash-high\tF\ngemini-3.5-flash-low\tF\n"
+                        "gemini-3.5-pro-high\tP\nclaude-sonnet-4-6\tS\nclaude-opus-4-6-thinking\tO\ngpt-oss-120b-medium\tG\n")
+            g["run_tree"] = lambda argv, timeout, **kw: calls.append((argv, kw["env"]["HOME"])) or (0, agy_list, "Fetching available models...")
+            assert [choose(ag, "edit", lv) for lv in LEVELS] == [("gemini-3.8-flash-low", None), ("gemini-3.8-flash-medium", None),
+                                                                 ("gemini-4-hydrogen-high", None), ("gemini-4-hydrogen-xhigh", None)]
+            assert calls[1:] == [(["agy.cmd", "models"], home)]  # cached once per process
+            g["AGY_MODELS"] = ["gemini-4-hydrogen-high", "gemini-3.8-flash-low"]
+            assert choose(ag, "edit", "max") == ("gemini-4-hydrogen-high", None)
+            g["AGY_MODELS"] = []
+            assert choose(ag, "search", "light") == (None, None)
+            g["run_tree"] = models_cli
+            assert argv_for(ag, "search", "m", None) == ["agy", "-p", "Follow the brief on stdin.", "--output-format", "json", "--model", "m", "--mode", "plan", "--dangerously-skip-permissions"]
+            assert argv_for(ag, "edit", None, None) == ["agy", "-p", "Follow the brief on stdin.", "--output-format", "json", "--dangerously-skip-permissions"]
+            agjob = {}
+            assert cli_reply("antigravity", json.dumps({"conversation_id": "c", "status": "SUCCESS", "response": "done", "duration_seconds": 1.97, "num_turns": 1,
+                             "usage": {"input_tokens": 11636, "output_tokens": 27, "thinking_tokens": 22, "cache_read_tokens": 0, "total_tokens": 11663}}), "", agjob) == ("done", "")
+            assert agjob == {"tokens": 11663}
+            assert cli_reply("antigravity", '{"status":"ERROR","response":"","error":"boom","finished_reason":"error"}', "", {}) == ("", "boom")
+            assert AUTH.search("Authentication required. Please visit the URL to log in:")
+            local = os.environ.get("LOCALAPPDATA")
+            os.environ["LOCALAPPDATA"] = folder
+            shutil.which = lambda name: None
+            (Path(folder) / "agy" / "bin").mkdir(parents=True)
+            (Path(folder) / "agy" / "bin" / "agy.exe").write_text("", encoding="utf-8")
+            assert which("agy") == str(Path(folder) / "agy" / "bin" / "agy.exe") and which("grok") is None
+            os.environ.pop("LOCALAPPDATA") if local is None else os.environ.update(LOCALAPPDATA=local)
+            shutil.which = lambda name: name + ".cmd"
             for kind in ("codex", "grok"):
                 cli(["add", kind, kind + "1"])
                 cli(["add", kind, kind + "2"])
@@ -1795,10 +1885,10 @@ def selftest():
             assert AUTH.search("API key not valid")
             mcp_real = {k: g[k] for k in ("load", "session_mcp", "with_auth", "mcp_rules")}
             try:
-                g.update(load=lambda: {"accounts": [{"id": "gem", "kind": "gemini", "paid": True}]},
+                g.update(load=lambda: {"accounts": [{"id": "gem", "kind": "gemini", "paid": True}, {"id": "ag", "kind": "antigravity", "paid": True}]},
                          session_mcp=lambda cwd: {"test": {}}, with_auth=lambda servers: (servers, []),
                          mcp_rules=lambda servers, cwd=None: ([], [], [], {}))
-                assert brief("look", "search", None, None, None, ".", ["test"]) == "Gemini delegates do not take MCP servers yet."
+                assert brief("look", "search", None, None, None, ".", ["test"]) == "Gemini and Antigravity delegates do not take MCP servers yet."
             finally:
                 g.update(mcp_real)
     finally:
