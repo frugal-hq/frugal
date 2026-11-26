@@ -56,19 +56,20 @@ frugal covers what caveman and ponytail do. If they are enabled, disable them: t
 
 ## Secondary accounts
 
-Other Claude logins, Codex, Grok, Gemini, and OpenCode can take the bounded work, so the main account's limits last. Set them up with `/frugal:accounts`:
+Other Claude logins, Codex, Grok, Antigravity, Gemini, and OpenCode can take the bounded work, so the main account's limits last. Set them up with `/frugal:accounts`:
 
 | Command | Needs |
 |---|---|
 | `add claude <id>` | Its own config in `~/.claude-<id>`, so it never touches the main login |
 | `add codex <id>` | The Codex login on this machine |
 | `add grok <id>` | A Grok login |
-| `add gemini <id> [--google] [--paid]` | An API key on stdin, never argv; `--paid` only with billing on, since free-tier keys may train on your data; `--google` signs in with a Google account instead of a key (login opens gemini; pick Login with Google, then /quit) |
+| `add antigravity <id> [--paid]` | A Google account, signed in through Antigravity's `agy` in the browser; `--paid` only on a paid Google plan, since Antigravity collects interactions for training by default |
+| `add gemini <id> [--paid]` | An API key on stdin, never argv; `--paid` only with billing on, since free-tier keys may train on your data |
 | `add opencode <id> <provider/model>` | Free models need no login |
 
-`add` installs a missing CLI with `npm install -g` when Node.js is on the PATH, and a second Codex or Grok account gets its own home in `~/.frugal/<kind>-<id>`. `status <id>` and `login-command <id>` print JSON, which Frugal Deck uses to add and sign in every account kind.
+`add` installs a missing CLI with `npm install -g` when Node.js is on the PATH (Antigravity with Google's installer), and a second Codex or Grok account gets its own home in `~/.frugal/<kind>-<id>`. `status <id>` and `login-command <id>` print JSON, which Frugal Deck uses to add and sign in every account kind.
 
-With an account set up, the `delegate` tool sends each task to the least-used account, in parallel for independent pieces. Heavy work goes to Claude, then Codex, then Grok, then Gemini, never to free OpenCode models. A failed try moves to another provider, a timed-out one moves up a level, and every try is logged in `~/.frugal/jobs.jsonl`. A task gets only the MCP servers it names, with their read-only tools, on every account kind except Gemini; a server listed as Claude-only goes only to Claude, and one with a list of account kinds in Frugal Deck only to those kinds. Needs `python` on the PATH; [Frugal Deck](https://github.com/frugal-hq/deck) shows the tasks of each chat.
+With an account set up, the `delegate` tool sends each task to the least-used account, in parallel for independent pieces. Heavy work goes to Codex, then Grok, then Claude, then Antigravity, then Gemini, never to free OpenCode models. A failed try moves to another provider, a timed-out one moves up a level, and every try is logged in `~/.frugal/jobs.jsonl`. A task gets only the MCP servers it names, with their read-only tools, on every account kind except Gemini and Antigravity; a server listed as Claude-only goes only to Claude, and one with a list of account kinds in Frugal Deck only to those kinds. Needs `python` on the PATH; [Frugal Deck](https://github.com/frugal-hq/deck) shows the tasks of each chat.
 
 ## Results
 
@@ -87,6 +88,7 @@ Every number comes from headless Claude Code runs, checked automatically, with a
 
 ## Versions
 
+- **0.32.0**: New account kind for Google's Antigravity CLI (`add antigravity <id> [--paid]`): each account signs in with Google in its own home, `~/.frugal/antigravity-<id>`, keeps its login in a file there, and runs the newest Gemini Flash for light and standard work and the newest Gemini at high (max: xhigh) effort for heavy work. It ranks after Claude and before Gemini for heavy work, takes no MCP servers or heads-up notes, and is blocked like an unpaid Gemini key until `opencode-training on` or `--paid`, since it collects interactions for training by default. Google stopped serving Gemini CLI to personal Google accounts on 2026-06-18, so `add gemini --google` is gone and points to `add antigravity`; a Gemini account still signed in that way leaves the pool as logged out.
 - **0.31.0**: `/frugal:performance` picks a mode, saved in `~/.frugal/performance.json`: light, balanced (the default) or performance. The chat's process tree gets the mode's CPU cap and priority, and past its parallel count or RAM budget the next shell command waits its turn, at most 10 minutes; performance never waits and always leaves 1 core and 2 GB free. `perf reap` lists processes left by closed chats and ends them only with `--kill`. Without Frugal Deck, the skill suggests OpenCode for free delegation. A chat that ignores the note and delegates nothing is stopped once per prompt, at 16 reads and searches or 17 shell commands; repeating the call goes through. Delegates keep scratch files in the temp folder, where one left prompt files in the repo. Grok jobs log the model they ran on.
 - **0.30.4**: Each failed delegate job in `jobs.jsonl` names its cause: `account` (logged out, at its limit, server errors), `env` (the check cannot run on this machine), `brief` (a timeout, a silent check, the same check failure twice), `code` (the check fails with an error) or `frugal`; Frugal Deck groups failed tasks by it. A benched account records why (`bench_reason`: limit or errors). A `run` check that runs past its time limit is reported as stopped unfinished, with a hint to run it here in the background or split it, where it said the command could not run here and showed as not delegated. A delegate command longer than cmd.exe's 8,191 characters (a Claude delegate with Pylon's 254 tool rules) runs its CLI directly instead of through npm's `.cmd` shim, where it failed with "The command line is too long."
 - **0.30.3**: Heavy and max work goes to an idle account first, in the order Codex, Grok, Claude: a busy Codex now hands work to Grok, and Claude, which took most heavy jobs and hit its 5-hour limit, goes last. A Claude account that hits that limit sits out until the reset time its message gives, where it was retried on every task. Gemini accounts can sign in with a Google account (`add gemini <id> --google`) instead of an API key. The `delegate` description says to split a brief that would run past its time limit.
