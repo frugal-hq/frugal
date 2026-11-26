@@ -50,13 +50,14 @@ AUTH = re.compile(r"\b401\b|not logged in|run /login|failed to authenticate|oaut
                   r"|invalid (api|x-api) key|api key not valid|authentication_error|not authenticated|not signed in|login required", re.I)
 HEAVY_RUN = re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run\s+)?(test|build|lint|typecheck)\b|(?<![.\w-])(pytest|jest|vitest|tsc|gradlew|mvn)(\.(bat|cmd|exe))?(?![.\w/-])|(?<![.\w/\\-])gradle(?![.\w/-])|\bpython\S*\s+\S*bench\.py\b"
                        r"|\b(cargo|go|dotnet)\s+(test|build)\b|\bclaude\s+plugin\s+test\b", re.I)
+SCRATCH_RULE = " Put scratch files (prompts, notes, intermediate data) in the system temp folder, never in the working directory."
 CODEX_RULES = (
     "Work rules: report results, not process; no filler, preamble or closing summary. Keep exact terms, code, commands, errors, "
     "numbers and every not, never and only. Verify APIs, versions and flags; never guess. For code: reuse what the codebase has, "
     "then the stdlib or native features, then installed dependencies; never add one for a few lines. Minimum code: no unrequested "
     "features, files, abstractions or config. Fix bugs at the root cause, and fix siblings with the same bug. Never cut validation, "
     "security or error handling that prevents data loss."
-)
+) + SCRATCH_RULE
 EXPLORE_BUDGET = 5
 # Shell commands per prompt that neither only read nor build: one chat ran 87 (scripts, edits by sed) in two sessions and delegated none.
 SHELL_BUDGET = 8
@@ -835,7 +836,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         if raw:
             pass  # the side agent gets only the brief
         elif a["kind"] == "claude":
-            prompt = "/frugal:frugal " + prompt  # loads frugal's rules in the delegated session
+            prompt = "/frugal:frugal " + prompt + "\n\n" + SCRATCH_RULE.strip()  # loads frugal's rules in the delegated session
         else:
             prompt = f"{CODEX_RULES}\n\n{prompt}"  # Codex cannot load the skill, so it gets the essentials
         env = child_env(a, {DELEGATED: "1"})
