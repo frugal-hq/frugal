@@ -1761,8 +1761,10 @@ def cli(args):
     if args == ["providers"]:  # Frugal Deck's and the skill's picker for add api: providers OpenCode can reach with a key, models that call tools
         rows = []
         for pid, p in catalog().items():
+            found = sorted(((mid, m) for mid, m in (p.get("models") or {}).items() if m.get("tool_call")), key=lambda i: i[1].get("name", i[0]).lower())
+            found.sort(key=lambda i: i[1].get("release_date") or "", reverse=True)  # newest first; stable, so ties stay by name and a missing date is last
             models = [{"id": mid, "name": m.get("name", mid), "input": (m.get("cost") or {}).get("input"), "output": (m.get("cost") or {}).get("output")}
-                      for mid, m in (p.get("models") or {}).items() if m.get("tool_call")]
+                      for mid, m in found]
             if p.get("env") and models:
                 rows.append({"id": pid, "name": p.get("name", pid), "env": p["env"][0], "models": models})
         return json.dumps(sorted(rows, key=lambda r: r["name"].lower()))
@@ -2111,6 +2113,11 @@ def selftest():
                 {"id": "abc", "name": "abc", "env": "FRUGALTEST_ABC_KEY", "models": [{"id": "z", "name": "Z", "input": 0.5, "output": None}]},
                 {"id": "prov", "name": "Prov", "env": "FRUGALTEST_PROV_KEY", "models": [{"id": "m", "name": "M", "input": 1, "output": 2},
                                                                                          {"id": "nocost", "name": "N", "input": None, "output": None}]}]
+            g["catalog"] = lambda: {"p": {"env": ["K"], "models": {"b": {"tool_call": True, "release_date": "2026-01-01"}, "a": {"tool_call": True, "release_date": "2026-01-01"},
+                                                                    "old": {"tool_call": True, "release_date": "2025-01-01"}, "none": {"tool_call": True},
+                                                                    "new": {"tool_call": True, "release_date": "2026-06-01"}}}}
+            assert [m["id"] for m in json.loads(cli(["providers"]))[0]["models"]] == ["new", "a", "b", "old", "none"]
+            g["catalog"] = lambda: stub
             limit_msg = "Limit must be a positive USD amount per day, week, month, quarter, year."
             for bad, msg in ((["nope", "m"], "Unknown provider nope; list them with: providers"), (["keyless", "m"], "Unknown provider keyless; list them with: providers"),
                              (["prov", "chat"], "prov has no model chat that can call tools; list them with: providers"),
