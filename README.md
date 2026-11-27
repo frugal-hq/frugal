@@ -56,7 +56,7 @@ frugal covers what caveman and ponytail do. If they are enabled, disable them: t
 
 ## Secondary accounts
 
-Other Claude logins, Codex, Grok, Antigravity, Gemini, and OpenCode can take the bounded work, so the main account's limits last. Set them up with `/frugal:accounts`:
+Other Claude logins, Codex, Grok, Antigravity, OpenCode, and pay-per-token API keys (Gemini among them) can take the bounded work, so the main account's limits last. Set them up with `/frugal:accounts`:
 
 | Command | Needs |
 |---|---|
@@ -64,12 +64,14 @@ Other Claude logins, Codex, Grok, Antigravity, Gemini, and OpenCode can take the
 | `add codex <id>` | The Codex login on this machine |
 | `add grok <id>` | A Grok login |
 | `add antigravity <id> [--paid]` | A Google account, signed in through Antigravity's `agy` in the browser; `--paid` only on a paid Google plan, since Antigravity collects interactions for training by default |
-| `add gemini <id> [--paid]` | An API key on stdin, never argv; `--paid` only with billing on, since free-tier keys may train on your data |
 | `add opencode <id> <provider/model>` | Free models need no login |
+| `add api <id> <provider> <model> [--limit <usd> <period>] [--paid]` | An API key on stdin, never argv, for any models.dev provider, run through OpenCode; a Gemini key is provider `google`, and `--paid` (google only) marks a key with billing on, since Google trains on free-tier API traffic |
+
+Accounts that may train on your data (unpaid google keys, unpaid Antigravity, OpenCode Zen models that train) are blocked until `training all` or `training some <id>...` allows them; `training` prints the setting and those accounts, `training off` blocks them again, and Frugal Deck's Settings set the same. Old Gemini CLI accounts with an API key become `google` api accounts on their own.
 
 `add` installs a missing CLI with `npm install -g` when Node.js is on the PATH (Antigravity with Google's installer), and a second Codex or Grok account gets its own home in `~/.frugal/<kind>-<id>`. `status <id>` and `login-command <id>` print JSON, which Frugal Deck uses to add and sign in every account kind.
 
-With an account set up, the `delegate` tool sends each task to the least-used account, in parallel for independent pieces. Heavy work goes to Codex, then Grok, then Claude, then Antigravity, then Gemini, never to free OpenCode models. A failed try moves to another provider, a timed-out one moves up a level, and every try is logged in `~/.frugal/jobs.jsonl`. A task gets only the MCP servers it names, with their read-only tools, on every account kind except Gemini and Antigravity; a server listed as Claude-only goes only to Claude, and one with a list of account kinds in Frugal Deck only to those kinds. Needs `python` on the PATH; [Frugal Deck](https://github.com/frugal-hq/deck) shows the tasks of each chat.
+With an account set up, the `delegate` tool sends each task to the least-used account, in parallel for independent pieces. Heavy work goes to Codex, then Grok, then Claude, then Antigravity, never to OpenCode or API keys. A failed try moves to another provider, a timed-out one moves up a level, and every try is logged in `~/.frugal/jobs.jsonl`. A task gets only the MCP servers it names, with their read-only tools, on every account kind except Antigravity; a server listed as Claude-only goes only to Claude, and one with a list of account kinds in Frugal Deck only to those kinds. Needs `python` on the PATH; [Frugal Deck](https://github.com/frugal-hq/deck) shows the tasks of each chat.
 
 ## Results
 
@@ -88,6 +90,7 @@ Every number comes from headless Claude Code runs, checked automatically, with a
 
 ## Versions
 
+- **0.32.0**: API key accounts. `add api <id> <provider> <model>` takes a pay-per-token key on stdin for any provider in the models.dev catalog (`providers` lists them with prices) and runs it through OpenCode. An optional `--limit <usd> <day|week|month|quarter|year>` (or `limit <id> ...` later) stops delegating to it once its spend in the period reaches the limit; API keys take light and standard work after free accounts. The Gemini CLI kind is gone: existing Gemini accounts become API key accounts on provider `google`, and `--paid` marks a Google key with billing on. Model training is allowed per account: `training off|all|some <id>...` replaces `opencode-training`, which stays as an alias.
 - **0.31.2**: Delegates are picked by rank. The recommended rank sorts accounts by their success over the last 30 days of `jobs.jsonl`, then by kind (Codex, Grok, Claude, Antigravity, Gemini, OpenCode); a custom rank, set in Frugal Deck as `order_mode` and `order` in `accounts.json`, puts the user's order first. Work still spreads across idle accounts, but each account's use today counts more the lower it ranks, so higher-ranked accounts take more of it. With the recommended rank, Grok still takes light and standard work last, since it is paid. `ranking` prints the order with each account's tries and success rate.
 - **0.31.1**: New account kind for Google's Antigravity CLI (`add antigravity <id> [--paid]`): each account signs in with Google in its own home, `~/.frugal/antigravity-<id>`, keeps its login in a file there, and runs the newest Gemini Flash for light and standard work and the newest Gemini at high (max: xhigh) effort for heavy work. It ranks after Claude and before Gemini for heavy work, takes no MCP servers or heads-up notes, and is blocked like an unpaid Gemini key until `opencode-training on` or `--paid`, since it collects interactions for training by default. Google stopped serving Gemini CLI to personal Google accounts on 2026-06-18, so `add gemini --google` is gone and points to `add antigravity`; a Gemini account still signed in that way leaves the pool as logged out.
 - **0.31.0**: `/frugal:performance` picks a mode, saved in `~/.frugal/performance.json`: light, balanced (the default) or performance. The chat's process tree gets the mode's CPU cap and priority, and past its parallel count or RAM budget the next shell command waits its turn, at most 10 minutes; performance never waits and always leaves 1 core and 2 GB free. `perf reap` lists processes left by closed chats and ends them only with `--kill`. Without Frugal Deck, the skill suggests OpenCode for free delegation. A chat that ignores the note and delegates nothing is stopped once per prompt, at 16 reads and searches or 17 shell commands; repeating the call goes through. Delegates keep scratch files in the temp folder, where one left prompt files in the repo. Grok jobs log the model they ran on.
