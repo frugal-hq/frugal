@@ -5,7 +5,7 @@ One file, stdlib only, four roles:
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
-  server.py list | add <claude|codex|grok> <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | selftest
+  server.py list | add <claude|codex|grok> <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | ranking | selftest
   server.py hook-gate       PreToolUse: wait for a free shell slot and RAM under the performance mode (no accounts required)
   server.py perf status | set <mode> | profile | reap [--kill]
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
@@ -435,24 +435,68 @@ def choose(a, kind, level=None, effort=None):
     return model, fit(effort or base, rule["efforts"])
 
 
-# heavy and max: Codex, Grok, Claude, Antigravity, then Gemini, idle accounts first; free OpenCode models never.
-# 2026-11-24: Claude ranked first took 22 of 30 heavy jobs and hit its 5-hour limit; busy Codex kept Grok idle.
+# heavy and max take these kinds only, never free OpenCode models; the values break rank ties (OpenCode last).
 STRONG = {"codex": 0, "grok": 1, "claude": 2, "antigravity": 3, "gemini": 4}
+STATS = {}
 
 
-def order(accounts, busy, level=None):
+def job_stats():
+    """{account id: (tries, ok)} over the last 30 days of jobs.jsonl, reparsed only when the file changes."""
+    # frugal: jobs.jsonl is never trimmed, so a change reparses the whole file; read only its tail if that gets slow.
+    try:
+        st = JOBS.stat()
+    except OSError:
+        return {}
+    key = (str(JOBS), st.st_mtime_ns, st.st_size)
+    if STATS.get("key") != key:
+        last = {}
+        for line in JOBS.read_text(encoding="utf-8").splitlines():
+            try:
+                j = json.loads(line)
+                last[j["id"]] = j  # a job is logged again as its status changes; the last line wins
+            except (ValueError, KeyError, TypeError):
+                continue
+        since, stats = time.time() - 30 * 86400, {}
+        for j in last.values():
+            if j.get("status") not in ("done", "failed") or (j.get("start") or j.get("end") or 0) < since:
+                continue
+            failed = [f.get("account") for f in j.get("failures") or [] if f.get("account")]
+            acc = j.get("account")
+            if acc and (j["status"] == "done" or acc not in failed):
+                failed.append(acc)
+            for aid in failed:
+                t, k = stats.get(aid, (0, 0))
+                stats[aid] = (t + 1, k + (aid == acc and j["status"] == "done"))
+        STATS.update(key=key, stats=stats)
+    return STATS["stats"]
+
+
+def ranked(accounts, data):
+    """Recommended: success rate over 30 days, then kind strength, then file order. Custom: data["order"] first."""
+    stats = job_stats()
+    rate = lambda a: (stats.get(a["id"], (0, 0))[1] + 1) / (stats.get(a["id"], (0, 0))[0] + 2)
+    out = sorted(accounts, key=lambda a: (-rate(a), STRONG.get(a.get("kind"), 5)))
+    if data.get("order_mode") == "custom":
+        pos = {aid: i for i, aid in enumerate(data.get("order") or [])}
+        out.sort(key=lambda a: pos.get(a["id"], len(pos)))
+    return out
+
+
+def order(accounts, busy, level=None, data=None):
     day = today()
+    rank = {a["id"]: i for i, a in enumerate(ranked(accounts, data or {}))}
     pool = ready(accounts)
     if level in ("heavy", "max"):
         pool = [a for a in pool if a["kind"] in STRONG]
-    # jobs.jsonl 2026-11-08..22: Grok averaged ~375k tokens per search against ~44k for Codex and ~130k for OpenCode,
-    # and was the only paid delegate ($18.36 in 43 jobs).
-    # frugal: rank by measured tokens per kind from jobs.jsonl when more kinds are paid.
     used = lambda a: a.get("used", 0) if a.get("day") == day else 0
-    if level in ("heavy", "max"):
-        # An account that ran out of time on a heavy job today goes last: a 20-minute timeout costs more than a slower pick.
-        return sorted(pool, key=lambda a: (a.get("slow_day") == day, busy.get(a["id"], 0), STRONG[a["kind"]], used(a)))
-    return sorted(pool, key=lambda a: (a.get("kind") == "grok", busy.get(a["id"], 0) * 1000 + used(a)))
+    # An account that ran out of time on a heavy job today goes last: a 20-minute timeout costs more than a slower pick.
+    # Then the least busy; then used today weighted by rank, so work spreads while higher-ranked accounts take more.
+    # 2026-11-24: Claude ranked first took 22 of 30 heavy jobs and hit its 5-hour limit; busy Codex kept Grok idle.
+    # jobs.jsonl 2026-11-08..22: Grok averaged ~375k tokens per search against ~44k for Codex and was the only paid delegate
+    # ($18.36 in 43 jobs), so the recommended order keeps it last for light and standard work; a custom order decides for itself.
+    paid_last = level not in ("heavy", "max") and (data or {}).get("order_mode") != "custom"
+    return sorted(pool, key=lambda a: (a.get("slow_day") == day, paid_last and a.get("kind") == "grok", busy.get(a["id"], 0),
+                                       used(a) * (1 + rank[a["id"]] / 2), rank[a["id"]]))
 
 
 def limit_until(text, now=None):
@@ -858,7 +902,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             # A task needing a claude_only_mcp server never goes to Codex, Grok or OpenCode, nor one needing a server with an
             # mcp_kinds list to an account of another kind; a server without a list goes to any kind.
             only, kinds = data.get("claude_only_mcp", []), data.get("mcp_kinds", {})  # both set per server in Frugal Deck's MCP servers
-            pool = [a for a in order(data["accounts"], BUSY, level) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode", "antigravity"))
+            pool = [a for a in order(data["accounts"], BUSY, level, data) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode", "antigravity"))
                     and not any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers) and not blocked(a, data)]
             if servers:  # frugal: Gemini and Antigravity delegates do not take MCP servers yet.
                 if pool and all(a["kind"] in ("gemini", "antigravity") for a in pool):
@@ -1564,6 +1608,10 @@ def cli(args):
                 + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
                 + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
         return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model>"
+    if args == ["ranking"]:  # Frugal Deck's order panel
+        stats, mode = job_stats(), "custom" if data.get("order_mode") == "custom" else "recommended"
+        return json.dumps([{"id": a["id"], "kind": a["kind"], "tries": t, "ok": k, "rate": round((k + 1) / (t + 2), 2), "mode": mode}
+                           for a in ranked(data["accounts"], data) for t, k in [stats.get(a["id"], (0, 0))]])
     if args[0] in ("status", "login-command") and len(args) == 2:
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
@@ -1698,13 +1746,37 @@ def selftest():
     assert limit_until("resets 12pm", base) == datetime.datetime(2026, 11, 24, 12, 0).timestamp() and limit_until("quota", base) == base + HOUR
     assert [a["id"] for a in order(pool, {"old": 1})] == ["b", "a", "old"]
     mixed = [{"id": "o", "kind": "opencode"}, {"id": "g", "kind": "grok"}, {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude", "used": 9, "day": today()}]
-    assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["x", "g", "c"] and order(mixed, {}, "standard")[0]["id"] == "o"
+    assert [a["id"] for a in order(mixed, {"c": 1}, "heavy")] == ["x", "g", "c"] and order(mixed, {}, "standard")[0]["id"] == "x"
     assert [a["id"] for a in order(mixed, {"x": 1}, "heavy")] == ["g", "c", "x"]
     mixed[2]["slow_day"] = today()
     assert [a["id"] for a in order(mixed, {}, "heavy")] == ["g", "c", "x"] and order(mixed, {}, "standard")[0]["id"] == "o"
     assert [a["id"] for a in order([{"id": "gm", "kind": "gemini"}, {"id": "ag", "kind": "antigravity"}, {"id": "c", "kind": "claude"}], {}, "heavy")] == ["c", "ag", "gm"]
     mixed = [{"id": "g", "kind": "grok", "used": 0, "day": today()}, {"id": "x", "kind": "codex", "used": 5, "day": today()}]
-    assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "x"
+    assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "g"
+    saved_jobs = JOBS
+    try:
+        globals()["JOBS"] = DIR / "rank-jobs.jsonl"
+        old = now - 40 * 86400
+        rows = [{"id": "1", "status": "running", "account": "g", "start": now}, {"id": "1", "status": "done", "account": "g", "start": now},
+                {"id": "2", "status": "done", "account": "g", "failures": [{"account": "x"}], "start": now},
+                {"id": "3", "status": "failed", "account": "c", "failures": [{"account": "c"}], "start": now},
+                {"id": "4", "status": "failed", "account": "x", "failures": [], "start": now},
+                {"id": "5", "status": "cancelled", "account": "o", "start": now}, {"id": "6", "status": "done", "account": "c", "start": old},
+                {"id": "7", "status": "running", "account": "c", "start": now}]
+        JOBS.write_text("\n".join(map(json.dumps, rows)) + "\nnot json\n", encoding="utf-8")
+        assert job_stats() == {"g": (2, 2), "x": (2, 0), "c": (1, 0)} and job_stats() is job_stats()
+        accts = [{"id": "x", "kind": "codex"}, {"id": "g", "kind": "grok"}, {"id": "c", "kind": "claude"}, {"id": "o", "kind": "opencode"}, {"id": "x2", "kind": "codex"}]
+        assert [a["id"] for a in ranked(accts, {})] == ["g", "x2", "o", "c", "x"]
+        assert [a["id"] for a in ranked(accts, {"order_mode": "custom", "order": ["c", "gone", "x"]})] == ["c", "x", "g", "x2", "o"]
+        assert [a["id"] for a in ranked(accts, {"order": ["c"]})] == ["g", "x2", "o", "c", "x"]
+        pair, picks = [{"id": "p", "kind": "codex", "used": 0, "day": today()}, {"id": "q", "kind": "claude", "used": 0, "day": today()}], []
+        for _ in range(10):
+            a = order(pair, {"p": 1, "q": 1})[0]
+            a["used"] += 1
+            picks.append(a["id"])
+        assert picks.count("p") == 6 and picks.count("q") == 4, picks
+    finally:
+        globals()["JOBS"] = saved_jobs
     assert "--effort" in argv_for(claude, "search", "haiku", "low") and "Bash Read Grep Glob" in argv_for(claude, "search", "haiku", "low")
     assert argv_for(codex, "run", None, "low")[-3:] == ["-s", "workspace-write", "-"]
     assert argv_for(claude, "note", "sonnet", "medium")[-3:] == ["--tools", "", "--strict-mcp-config"]
@@ -2145,7 +2217,7 @@ def selftest():
         assert json.loads((cfg / "mcp-needs-auth-cache.json").read_text(encoding="utf-8")) == {"x": {}}
         os.environ["FRUGAL_DECK_MCP"] = "{}"
         g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (envs.append((argv[0], env, argv)), (0, "ok", ""))[1],
-                 load=lambda: {"claude_only_mcp": ["serviceminder"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
+                 load=lambda: {"claude_only_mcp": ["serviceminder"], "order_mode": "custom", "order": ["gk", "oc", "cl"], "accounts": [{"id": "gk", "kind": "grok"}, {"id": "oc", "kind": "opencode", "model": "m"}, {"id": "cl", "kind": "claude"}]})
         assert brief("look", "search", None, None, None, ".").startswith("Done by") and brief("note", "note", None, None, None, ".") == "ok"
         (k1, e1, a1), (k2, e2, _) = envs[-2:]
         assert k1 in ("grok", "opencode") and "FRUGALTEST_SERVICEMINDER_TOKEN" not in e1 and e1.get("GROK_CLAUDE_MCPS_ENABLED", "false") == "false"
@@ -2259,7 +2331,8 @@ def selftest():
                 {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude"}]
     tries, replies = [], []
     g.update(run_cli=lambda argv, prompt, cwd, env, timeout=600: (tries.append((argv[0], timeout)), prompts.append(prompt), replies.pop(0))[2],
-             load=lambda: {"accounts": [dict(a) for a in accounts]}, save=lambda data: None, log_job=lambda entry: None)
+             load=lambda: {"accounts": [dict(a) for a in accounts], "order_mode": "custom", "order": [a["id"] for a in accounts]},
+             save=lambda data: None, log_job=lambda entry: None)
     try:
         replies[:] = [(1, "", "server error"), (0, "ok", "")]
         assert brief("look", "search", None, "standard", None, ".").startswith("Done by x") and [t[0] for t in tries] == ["opencode", "codex"], tries
