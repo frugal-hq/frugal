@@ -1,17 +1,17 @@
-"""frugal accounts: secondary Claude, Codex, Grok, Antigravity, Gemini and OpenCode logins that take delegated work.
+"""frugal accounts: secondary Claude, Codex, Grok, Antigravity, OpenCode and API-key logins that take delegated work.
 
 One file, stdlib only, four roles:
   server.py                 MCP server (stdio) exposing `delegate` while an account is set up
   server.py hook-prompt     UserPromptSubmit hook: the delegation rule, then a one-line reminder
   server.py hook-pretool    PreToolUse hook: sends test runs, long explorations (shell reads too), long edit runs and subagents to delegate
   server.py hook-stop       Stop hook (Claude Desktop only): a side agent reads the session and may wake Claude with a heads-up
-  server.py list | add <claude|codex|grok> <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model> | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | ranking | selftest
+  server.py list | add <claude|codex|grok> <id> | add antigravity <id> [--paid] | add opencode <id> <provider/model> | add api <id> <provider> <model> [--limit <usd> <day|week|month|quarter|year>] [--paid] | limit <id> <usd> <period> | limit <id> off | providers | training [off|all|some <id>...] | opencode-training <on|off> | remove <id> | login <id> | status <id> | login-command <id> | ranking | selftest
   server.py hook-gate       PreToolUse: wait for a free shell slot and RAM under the performance mode (no accounts required)
   server.py perf status | set <mode> | profile | reap [--kill]
 Nothing happens while ~/.frugal/accounts.json lists no account, so frugal without accounts is unchanged.
 Performance modes are separate: they apply with no accounts, from ~/.frugal/performance.json (missing means balanced).
 """
-import concurrent.futures, contextlib, datetime, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback
+import concurrent.futures, contextlib, datetime, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib, traceback, urllib.request
 from pathlib import Path
 
 import perf
@@ -35,8 +35,6 @@ RULES = {
     # grok uses the CLI default model; it takes low, medium, high, xhigh (rejects minimal and max yet still exits 0).
     "grok": {"efforts": ["low", "medium", "high", "xhigh"],
              "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "xhigh")}},
-    "gemini": {"efforts": [],
-               "levels": {"light": ("flash-lite", None), "standard": ("flash", None), "heavy": ("pro", None), "max": ("pro", None)}},
     # Antigravity (agy) names the effort in the model id: gemini-<version>-<name>-<effort>; max falls back to high.
     "antigravity": {"efforts": [],
                     "levels": {"light": ("flash-low", None), "standard": ("flash-medium", None), "heavy": ("high", None), "max": ("xhigh", None)}},
@@ -44,8 +42,10 @@ RULES = {
     "opencode": {"efforts": ["low", "medium", "high"],
                  "levels": {"light": (None, "low"), "standard": (None, "medium"), "heavy": (None, "high"), "max": (None, "high")}},
 }
+RULES["api"] = RULES["opencode"]  # a pay-per-token key runs through OpenCode on the one model its account names
+PERIODS = ("day", "week", "month", "quarter", "year")
 PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex", "grok": "@xai-official/grok",
-            "opencode": "opencode-ai", "gemini": "@google/gemini-cli", "antigravity": "the Antigravity CLI"}
+            "opencode": "opencode-ai", "antigravity": "the Antigravity CLI"}
 # Antigravity's CLI is not on npm (verified with agy 1.5.18).
 AGY_INSTALL = (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://antigravity.google/cli/install.ps1 | iex"] if os.name == "nt"
                else ["bash", "-c", "curl -fsSL https://antigravity.google/cli/install.sh | bash"])
@@ -91,22 +91,76 @@ HEADS_UP_ASK = (
     "user would not expect. Skip anything Claude already told the user plainly, style points and guesses. If nothing clears "
     "that bar, reply exactly: none. Otherwise reply with one plain sentence under 40 words, in the user's language, no preamble."
 )
-# OpenCode Zen models that may train on, or warn against, what they receive (opencode.ai/docs/zen). Blocked until the user turns opencode-training on.
+# OpenCode Zen models that may train on, or warn against, what they receive (opencode.ai/docs/zen). Blocked unless training allows them.
 TRAINING_MODELS = ("big-pickle", "mimo", "flint", "iceman", "inkling", "nemotron")
 MAX_TRIES = 3
 HOUR = 3600
 
 
 def load():
+    data = read_json(FILE) or {"accounts": []}
+    if "opencode_allow_training" in data or not CATALOG_DOWN and any(a.get("kind") == "gemini" and legacy_key(a) for a in data["accounts"]):
+        with file_lock():
+            data = read_json(FILE) or {"accounts": []}  # another process may have migrated it meanwhile
+            if migrate(data):
+                save(data)
+    return data
+
+
+CATALOG_DOWN = False  # the catalog failed once in this process: legacy Gemini accounts wait for the next one
+
+
+def legacy_key(a):
+    # The API key of a legacy Gemini CLI account (that kind ended with Google's personal login, 2026-06-18).
     try:
-        return json.loads(FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"accounts": []}
+        m = re.search(r"^GEMINI_API_KEY=(.*)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)
+    except (OSError, KeyError, TypeError):
+        return ""
+    return m[1].strip() if m else ""
+
+
+def gemini_flash(models):
+    # The newest Gemini Flash by release_date that calls tools and is not lite, image, tts, live, preview or exp; else any Gemini Flash.
+    flash = [(m.get("release_date") or "", mid) for mid, m in models.items() if re.match(r"gemini-.*flash", mid)]
+    best = [f for f in flash if models[f[1]].get("tool_call") and not re.search(r"lite|image|tts|live|preview|exp", f[1])]
+    return max(best or flash, default=(None, None))[1]
+
+
+def migrate(data):
+    """Legacy migrations, idempotent: opencode_allow_training becomes training "all"; a legacy Gemini CLI account with an
+    API key becomes an api account on Google. One without a key stays in the file, out of the pool, until removed."""
+    global CATALOG_DOWN
+    changed = "opencode_allow_training" in data
+    if data.pop("opencode_allow_training", False):
+        data["training"] = "all"
+    legacy = [(a, key) for a in data["accounts"] if a.get("kind") == "gemini" and (key := legacy_key(a))]
+    if legacy and not CATALOG_DOWN:
+        try:
+            model = gemini_flash(catalog()["google"].get("models") or {})
+        except (SystemExit, KeyError, TypeError, AttributeError):
+            CATALOG_DOWN, model = True, None
+        for a, key in legacy if model else []:
+            for k in ("home", "auth"):
+                a.pop(k, None)
+            a.update(kind="api", provider="google", model=f"google/{model}", data_dir=str(DIR / f"api-{a['id']}"), paid=bool(a.get("paid", False)))
+            write_private(Path(a["data_dir"]) / "key", key + "\n")
+            changed = True
+    return changed
+
+
+HELD = threading.local()  # file_lock depth per thread: load() migrates under the lock, and is often called while it is held
 
 
 @contextlib.contextmanager
 def file_lock():
     """Serializes read-modify-write of frugal's files across processes: the MCP server and every session's hooks."""
+    if getattr(HELD, "n", 0):
+        HELD.n += 1
+        try:
+            yield
+        finally:
+            HELD.n -= 1
+        return
     path = DIR / "files.lock"
     DIR.mkdir(exist_ok=True)
     fd = None
@@ -121,9 +175,11 @@ def file_lock():
             except OSError:
                 pass
             time.sleep(0.01)
+    HELD.n = 1
     try:
         yield
     finally:
+        HELD.n = 0
         if fd is not None:
             os.close(fd)
             try:
@@ -141,6 +197,66 @@ def save(data):
 
 def today():
     return datetime.date.today().isoformat()
+
+
+def agent(kind):
+    # The CLI an account kind runs: an api key runs OpenCode, minus OpenCode's free-model and Zen training rules.
+    return "opencode" if kind == "api" else kind
+
+
+def period_start(period, day=None):
+    d = day or datetime.date.today()
+    return {"day": d, "week": d - datetime.timedelta(days=d.weekday()), "month": d.replace(day=1),
+            "quarter": d.replace(month=(d.month - 1) // 3 * 3 + 1, day=1), "year": d.replace(month=1, day=1)}[period].isoformat()
+
+
+def spent(a, day=None):
+    # USD in the current period; spend from an earlier period counts as 0.
+    s = a.get("spend") or {}
+    return s.get("usd", 0) if s.get("since") == period_start(a.get("spend_period") or "month", day) else 0
+
+
+def add_spend(a, usd, day=None):
+    a["spend"] = {"since": period_start(a.get("spend_period") or "month", day), "usd": spent(a, day) + usd}
+
+
+def over_limit(a):
+    return a.get("kind") == "api" and a.get("spend_limit") is not None and spent(a) >= a["spend_limit"]
+
+
+def spend_limit(usd, period):
+    try:
+        v = float(usd)
+    except ValueError:
+        v = 0
+    if not 0 < v < float("inf") or period not in PERIODS:
+        raise SystemExit(f"Limit must be a positive USD amount per {', '.join(PERIODS)}.")
+    return v
+
+
+def catalog():
+    """models.dev's providers and models (cost in USD per 1M tokens), cached a day in models.json; the stale copy when a fetch fails."""
+    path = DIR / "models.json"
+    try:
+        fresh = time.time() - path.stat().st_mtime < 86400
+    except OSError:
+        fresh = False
+    if not fresh:
+        try:
+            # models.dev answers urllib's default User-Agent with 403
+            with urllib.request.urlopen(urllib.request.Request("https://models.dev/api.json", headers={"User-Agent": "frugal"}), timeout=20) as r:
+                data = json.loads(r.read())
+            DIR.mkdir(exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+            return data
+        except (OSError, ValueError):
+            pass
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise SystemExit("Could not load the model catalog from models.dev.")
 
 
 def same(p):
@@ -367,7 +483,7 @@ def mcp_for(kind, servers, ro):
     args, env, conf = [], {}, {"mcp": {}, "permission": {}}
     for i, (name, c) in enumerate(servers.items()):
         key, heads, envs = mcp_rule(name)[5:], c.get("headers") or {}, c.get("env") or {}
-        if kind == "opencode":
+        if agent(kind) == "opencode":
             conf["mcp"][key] = ({"type": "remote", "url": c["url"], "headers": heads} if c.get("url")
                                 else {"type": "local", "command": [c["command"], *(c.get("args") or [])], "environment": envs})
             conf["permission"].update({f"{key}_*": "deny", **{f"{key}_{mcp_rule(t)[5:]}": "allow" for t in ro[name]}})  # the last matching rule wins
@@ -383,7 +499,7 @@ def mcp_for(kind, servers, ro):
             args += ["-c", p + "command=" + json.dumps(c["command"]), "-c", p + "args=" + json.dumps(c.get("args") or [])]
             args += ["-c", p + "env_vars=" + json.dumps(list(envs))] if envs else []
         args += ["-c", p + "enabled_tools=" + json.dumps(ro[name])]
-    if kind == "opencode":
+    if agent(kind) == "opencode":
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(conf)
     return args, env
 
@@ -401,7 +517,8 @@ def clear_needs_auth(config_dir, names):
 
 def ready(accounts, now=None):
     now = time.time() if now is None else now
-    return [a for a in accounts if a.get("enabled", True) and not a.get("needs_login") and a.get("exhausted_until", 0) <= now and not own(a)]
+    return [a for a in accounts if a.get("enabled", True) and not a.get("needs_login") and a.get("exhausted_until", 0) <= now and not own(a) and not over_limit(a)
+            and a.get("kind") in RULES]  # a legacy kind waits in the file to be removed
 
 
 def active():
@@ -424,19 +541,17 @@ def choose(a, kind, level=None, effort=None):
         models = codex_models(a) or a.get("models") or []
         model = max((slug for slug in models if re.fullmatch(rf"gpt-[\d.]+-{model}", slug)),
                     key=lambda slug: tuple(map(int, slug.split("-")[1].split("."))), default=None)
-    if a["kind"] == "gemini":
-        model = next((slug for slug in gemini_models() if re.fullmatch(rf"gemini-[\d.]+-{model}", slug)), "auto") if model != "pro" else "auto"
     if a["kind"] == "antigravity":
         name = "flash" if model.startswith("flash") else "(?!flash)[a-z]+"
         tiers = [model.removeprefix("flash-")] + (["high"] if model == "xhigh" else [])
         model = next((m for t in tiers for m in agy_models(a) if re.fullmatch(rf"gemini-[\d.]+-{name}-{t}", m)), None)
-    if a["kind"] == "opencode":
+    if agent(a["kind"]) == "opencode":
         model = a["model"]
     return model, fit(effort or base, rule["efforts"])
 
 
 # heavy and max take these kinds only, never free OpenCode models; the values break rank ties (OpenCode last).
-STRONG = {"codex": 0, "grok": 1, "claude": 2, "antigravity": 3, "gemini": 4}
+STRONG = {"codex": 0, "grok": 1, "claude": 2, "antigravity": 3}
 STATS = {}
 
 
@@ -493,9 +608,10 @@ def order(accounts, busy, level=None, data=None):
     # Then the least busy; then used today weighted by rank, so work spreads while higher-ranked accounts take more.
     # 2026-11-24: Claude ranked first took 22 of 30 heavy jobs and hit its 5-hour limit; busy Codex kept Grok idle.
     # jobs.jsonl 2026-11-08..22: Grok averaged ~375k tokens per search against ~44k for Codex and was the only paid delegate
-    # ($18.36 in 43 jobs), so the recommended order keeps it last for light and standard work; a custom order decides for itself.
+    # ($18.36 in 43 jobs), so the recommended order keeps it last for light and standard work, and pay-per-token api keys with it;
+    # a custom order decides for itself.
     paid_last = level not in ("heavy", "max") and (data or {}).get("order_mode") != "custom"
-    return sorted(pool, key=lambda a: (a.get("slow_day") == day, paid_last and a.get("kind") == "grok", busy.get(a["id"], 0),
+    return sorted(pool, key=lambda a: (a.get("slow_day") == day, paid_last and a.get("kind") in ("grok", "api"), busy.get(a["id"], 0),
                                        used(a) * (1 + rank[a["id"]] / 2), rank[a["id"]]))
 
 
@@ -515,19 +631,6 @@ def codex_models(a=None):
         return [m["slug"] for m in cache.get("models", []) if m.get("visibility") != "hide"]
     except (OSError, ValueError, KeyError):
         return []
-
-
-GEMINI_MODELS = None
-
-
-def gemini_models():
-    global GEMINI_MODELS
-    if GEMINI_MODELS is None:
-        exe = shutil.which("gemini")
-        r = run_tree([exe, "models", "list"], 60) if exe else None
-        models = set(re.findall(r"(?m)^gemini-\d+(?:\.\d+)*-(?:flash-lite|flash|pro)(?=\s|$)", r[1])) if r and r[0] == 0 else set()
-        GEMINI_MODELS = sorted(models, key=lambda m: tuple(map(int, m.split("-")[1].split("."))), reverse=True)
-    return GEMINI_MODELS
 
 
 AGY_MODELS = None
@@ -551,11 +654,16 @@ def codex_mcp(a=None):
         return set()
 
 
-def blocked(a, data):
+def may_train(a):
     m = (a.get("model") or "").lower()
-    return ((a["kind"] in ("gemini", "antigravity") and not a.get("paid")
-             or a["kind"] == "opencode" and m.startswith("opencode/") and any(t in m for t in TRAINING_MODELS))
-            and not data.get("opencode_allow_training", False))
+    return (a["kind"] == "antigravity" and not a.get("paid") or a["kind"] == "api" and a.get("provider") == "google" and not a.get("paid")
+            or a["kind"] == "opencode" and m.startswith("opencode/") and any(t in m for t in TRAINING_MODELS))
+
+
+def blocked(a, data):
+    # data["training"]: "off" (default), "all", or "some" with the allowed ids in data["training_allowed"]; set in Frugal Deck's Settings.
+    mode = data.get("training", "off")
+    return may_train(a) and not (mode == "all" or mode == "some" and a["id"] in data.get("training_allowed", []))
 
 
 def why_none(data, servers, level, now=None):
@@ -565,27 +673,29 @@ def why_none(data, servers, level, now=None):
     rules = [f"{n} goes only to {', '.join(['claude'] if n in only else kinds[n])} accounts" for n in servers if n in only or n in kinds]
     states = []
     for a in data["accounts"]:
-        if own(a) or servers and a["kind"] in ("gemini", "antigravity") or any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers):
+        if a.get("kind") not in RULES or own(a) or servers and a["kind"] == "antigravity" or any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers):
             continue
         state = ("off" if not a.get("enabled", True) else "logged out" if a.get("needs_login")
                  else f"{'benched for errors' if a.get('bench_reason') == 'errors' else 'at its limit'} until {time.strftime('%H:%M', time.localtime(a['exhausted_until']))}" if a.get("exhausted_until", 0) > now
-                 else "blocked" if blocked(a, data) else "too light for heavy work" if level in ("heavy", "max") and a["kind"] not in STRONG else "")
+                 else "over its spend limit" if over_limit(a) else "blocked" if blocked(a, data) else "too light for heavy work" if level in ("heavy", "max") and a["kind"] not in STRONG else "")
         if state:
             states.append(f"{name(a['id'])} {state}")
     return "; ".join(rules + (states or ["no account of those kinds"] if rules else states))
 
 
+def train_reason(a):
+    return ("Antigravity collects interactions for training by default" if a["kind"] == "antigravity"
+            else "Google trains on free-tier API traffic" if a["kind"] == "api" else "this OpenCode Zen model may train on what it receives")
+
+
 def training_message(a):
-    return ("it is on Gemini's free tier and may train on your data (opencode-training on; re-add with --paid if billing or a paid Google plan is on)"
-            if a["kind"] == "gemini" else "Antigravity may train on your interactions by default (opencode-training on; re-add with --paid if a paid Google plan is on)"
-            if a["kind"] == "antigravity" else "its model may train on your data (opencode-training on)")
+    paid = {"antigravity": "; or re-add with --paid if a paid Google plan is on", "api": "; or re-add with --paid if billing is on for this key"}.get(a["kind"], "")
+    return f"{train_reason(a)} (allow it with: training all, or training some {a['id']}, or in Frugal Deck Settings{paid})"
 
 
 def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mcp_deny=(), mcp_args=()):
-    if a["kind"] == "gemini":
-        # A non-empty -p also works in nested sessions; the brief arrives on stdin, as for Claude and Codex.
-        return ["gemini", "-p", "Follow the brief on stdin.", "-o", "json", "--approval-mode", "plan" if kind in ("search", "note") else "yolo", "-m", model]
     if a["kind"] == "antigravity":
+        # A non-empty -p also works in nested sessions; the brief arrives on stdin, as for Claude and Codex.
         # Headless agy soft-denies every shell call it cannot prompt for; permissions.allow/deny rules did not stop its file-write tool
         # (agy 1.5.18, 2026-11-26), so it always approves, and plan mode keeps search on reading, as Grok's search keeps the shell.
         return ["agy", "-p", "Follow the brief on stdin.", "--output-format", "json", *(["--model", model] if model else []),
@@ -606,7 +716,7 @@ def argv_for(a, kind, model, effort, mcp_off=(), mcp_file=None, mcp_allow=(), mc
         # MCP servers come in an agent file; deny rules (server__tool) block the tools that are not read-only, even under --always-approve.
         tools += (["--agent", mcp_file] if mcp_file else []) + [x for r in mcp_deny for x in ("--deny", f"MCPTool({r[5:]})")]
         return ["grok", "--no-auto-update", *(["-m", model] if model else []), "--effort", effort, "--always-approve", "--output-format", "json", *tools]
-    if a["kind"] == "opencode":
+    if agent(a["kind"]) == "opencode":
         # --auto approves what is not denied; the plan agent denies edits, so search stays read-only (tested on opencode 1.19.5)
         return ["opencode", "run", "-m", model, "--variant", effort, "--agent", "plan" if kind == "search" else "build", "--auto", "--format", "json"]
     sandbox = ["-s", "workspace-write"] if kind in ("edit", "run") else []
@@ -809,10 +919,6 @@ def cli_reply(agent, out, err, job):
             if used_models := j.get("modelUsage"):  # keyed by model id; subagents add rows, so the one with most calls ran the task
                 job["model"] = max(used_models, key=lambda m: used_models[m].get("modelCalls") or 0)
             return j.get("text") or "", err or ("" if j.get("text") else out)
-        if agent == "gemini":  # JsonFormatter: {session_id, response, stats, error?, warnings?}
-            j = json.loads(out)
-            add(sum((m.get("tokens") or {}).get("total") or 0 for m in ((j.get("stats") or {}).get("models") or {}).values()))
-            return ("", err or (j["error"].get("message") or out)) if j.get("error") else (j.get("response") or "", err)
         if agent == "antigravity":  # --output-format json: {status, response, error?, usage}
             j = json.loads(out)
             add((j.get("usage") or {}).get("total_tokens"))
@@ -902,12 +1008,12 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
             # A task needing a claude_only_mcp server never goes to Codex, Grok or OpenCode, nor one needing a server with an
             # mcp_kinds list to an account of another kind; a server without a list goes to any kind.
             only, kinds = data.get("claude_only_mcp", []), data.get("mcp_kinds", {})  # both set per server in Frugal Deck's MCP servers
-            pool = [a for a in order(data["accounts"], BUSY, level, data) if a["id"] not in tried and not (raw and a["kind"] in ("grok", "opencode", "antigravity"))
+            pool = [a for a in order(data["accounts"], BUSY, level, data) if a["id"] not in tried and not (raw and agent(a["kind"]) in ("grok", "opencode", "antigravity"))
                     and not any(a["kind"] != "claude" and n in only or n in kinds and a["kind"] not in kinds[n] for n in servers) and not blocked(a, data)]
-            if servers:  # frugal: Gemini and Antigravity delegates do not take MCP servers yet.
-                if pool and all(a["kind"] in ("gemini", "antigravity") for a in pool):
-                    return "Gemini and Antigravity delegates do not take MCP servers yet."
-                pool = [a for a in pool if a["kind"] not in ("gemini", "antigravity")]
+            if servers:  # frugal: Antigravity delegates do not take MCP servers yet.
+                if pool and all(a["kind"] == "antigravity" for a in pool):
+                    return "Antigravity delegates do not take MCP servers yet."
+                pool = [a for a in pool if a["kind"] != "antigravity"]
             if not pool:
                 break
             # After a failure another provider goes first: three free OpenCode models failed one after another on its server errors.
@@ -935,7 +1041,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
         if a["kind"] == "grok":
             env.update(GROK_CLAUDE_MCPS_ENABLED="false", GROK_CLAUDE_HOOKS_ENABLED="false")  # grok loads Claude's MCP servers and hooks by default
         off = [n for n in only if n in codex_mcp(a)] if a["kind"] == "codex" else []
-        mcp_args, mcp_env = mcp_for(a["kind"], servers, ro) if servers and a["kind"] in ("codex", "opencode") else ([], {})
+        mcp_args, mcp_env = mcp_for(a["kind"], servers, ro) if servers and agent(a["kind"]) in ("codex", "opencode") else ([], {})
         env.update(mcp_env)
         mcp_file = None
         if servers and a["kind"] in ("claude", "grok"):  # a file, not an argument: server configs can carry tokens, and a command line is visible to every process
@@ -970,12 +1076,16 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                 BUSY[a["id"]] -= 1
             if mcp_file:
                 os.unlink(mcp_file)
-        out, err = cli_reply(a["kind"], out, err, job)
+        cost = job.get("cost", 0)
+        out, err = cli_reply(agent(a["kind"]), out, err, job)
+        cost = job.get("cost", 0) - cost  # this try's cost: job's adds up every try, on any account
         model = job.get("model")  # grok names its model only in its output
         with LOCK, file_lock():
             data = load()
             for x in data["accounts"]:
                 if x["id"] == a["id"]:
+                    if x["kind"] == "api" and cost:
+                        add_spend(x, cost)
                     if code != 0 and AUTH.search(out + err):
                         x["needs_login"] = True
                         relog.append(a["id"])
@@ -985,7 +1095,7 @@ def brief(text, kind, check, level, effort, cwd, mcp=(), job=None):
                     else:
                         # GLM and crouton OpenCode models failed 33 times in two weeks with the same "Unexpected server error",
                         # each retried every task. Only the same error counts, ids and timestamps aside: one network blip never benches.
-                        if code != 0 and code != 124 and x["kind"] == "opencode":
+                        if code != 0 and code != 124 and agent(x["kind"]) == "opencode":
                             sig = re.sub(r"\w*\d\w*", "", (err or out)[-300:])
                             same = x.get("errors_day") == today() and x.get("error_sig") == sig
                             x["errors"], x["errors_day"], x["error_sig"] = (x.get("errors", 0) if same else 0) + 1, today(), sig
@@ -1502,19 +1612,21 @@ def account_env(a):
     if a.get("kind") == "antigravity":  # config in <home>/.gemini/antigravity-cli, the login in a file there instead of Credential Manager
         return {"USERPROFILE": a["home"], "HOME": a["home"], "AGY_CLI_FORCE_FILE_TOKEN_STORAGE": "1"}
     if a.get("home"):
-        return {{"codex": "CODEX_HOME", "grok": "GROK_HOME", "gemini": "GEMINI_CLI_HOME"}[a["kind"]]: a["home"]}
+        return {{"codex": "CODEX_HOME", "grok": "GROK_HOME"}[a["kind"]]: a["home"]}
     return {"CLAUDE_CONFIG_DIR": a["config_dir"]} if a.get("config_dir") else {"XDG_DATA_HOME": a["data_dir"]} if a.get("data_dir") else {}
 
 
 def child_env(a, extra=None):
     # The main account uses the default folder, so its delegate drops the CLAUDE_CONFIG_DIR this session may run with.
     env = {**os.environ, **(extra or {}), **account_env(a)}
-    if a.get("kind") == "gemini":
-        env.pop("GEMINI_API_KEY", None)  # never use the parent's key
+    if a.get("kind") == "api":
+        names = catalog()[a["provider"]]["env"]
+        for n in names:
+            env.pop(n, None)  # never use the parent's key
         try:
-            if (key := re.search(r"^GEMINI_API_KEY=(.+)$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)):
-                env["GEMINI_API_KEY"] = key[1]
-        except (OSError, ValueError):
+            if (key := (Path(a["data_dir"]) / "key").read_text(encoding="utf-8").strip()):
+                env.update(dict.fromkeys(names, key))  # every name the provider lists: OpenCode reads them in its own order
+        except OSError:
             pass
     if env.get("CLAUDE_CONFIG_DIR") and same(env["CLAUDE_CONFIG_DIR"]) == same(HOME / ".claude"):
         del env["CLAUDE_CONFIG_DIR"]
@@ -1541,9 +1653,9 @@ def logged_in(a):
             return (Path(a["home"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").stat().st_size > 0, None
         except OSError:
             return False, None
-    if a["kind"] == "gemini":  # an API key; a Google login (ended 2026-06-18) has none, so it reads as logged out
+    if a["kind"] == "api":
         try:
-            return bool(re.search(r"^GEMINI_API_KEY=.+$", (Path(a["home"]) / ".gemini" / ".env").read_text(encoding="utf-8"), re.M)), None
+            return bool((Path(a["data_dir"]) / "key").read_text(encoding="utf-8").strip()), None
         except OSError:
             return False, None
     if a["kind"] in ("grok", "opencode"):
@@ -1563,7 +1675,7 @@ def logged_in(a):
 
 
 def login_command(a):
-    argv = None if a["kind"] == "gemini" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or blocked(a, {})) else {
+    argv = None if a["kind"] == "api" or a["kind"] == "opencode" and (a.get("model", "").endswith(("-free", ":free")) or may_train(a)) else {
         "claude": ["claude", "auth", "login"], "codex": ["codex", "login"], "grok": ["grok", "login"], "opencode": ["opencode", "auth", "login"], "antigravity": ["agy"]}[a["kind"]]
     return {"argv": argv, "env": account_env(a)}
 
@@ -1600,14 +1712,71 @@ def login(a):
 PENDING = []  # accounts to sign in once cli() is done: login() waits for the user, so it runs outside the file lock
 
 
+def read_key(what):
+    key = sys.stdin.readline().rstrip("\r\n")  # stdin, never argv: a command line is visible to every process
+    if not key or not key.isprintable() or any(c.isspace() for c in key):
+        raise SystemExit(f"{what} must be non-empty printable text without spaces.")
+    return key
+
+
+def write_private(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+            tmp = Path(f.name)
+            if os.name != "nt":
+                os.chmod(tmp, 0o600)
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def api_flags(rest):
+    # add api's --limit <usd> <period> and --paid, in any order, each once: (limit or None, paid), or None when malformed.
+    limit, paid = None, False
+    while rest:
+        if rest[0] == "--paid" and not paid:
+            paid, rest = True, rest[1:]
+        elif rest[0] == "--limit" and not limit and len(rest) >= 3:
+            limit, rest = rest[1:3], rest[3:]
+        else:
+            return None
+    return limit, paid
+
+
 def cli(args):
     data = load()
     if args[:1] == ["list"] or not args:
         rows = [f"{a['id']}: {a['kind']}{f" {a['model']}" if a.get('model') else ''}{' (off)' if not a.get('enabled', True) else ''}, used today {a.get('used', 0) if a.get('day') == today() else 0}"
+                + ((f", ${spent(a):.2f} / ${a['spend_limit']:.2f} per {a['spend_period']}" if a.get("spend_limit") is not None
+                    else f", ${spent(a):.2f} this month") if a["kind"] == "api" else "")
                 + ((", benched for errors" if a.get("bench_reason") == "errors" else ", at its limit") if a.get("exhausted_until", 0) > time.time() else "")
                 + (f", blocked: {training_message(a)}" if blocked(a, data) else "")
-                + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") for a in data["accounts"]]
-        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add <gemini|antigravity> <id> [--paid] | add opencode <id> <provider/model>"
+                + (f", logged out (run: login {a['id']})" if a.get("needs_login") else "") if a.get("kind") in RULES
+                else f"{a['id']} (unsupported kind {a.get('kind')}: remove it)" for a in data["accounts"]]
+        return "\n".join(rows) or "No secondary accounts. Add one with: add claude <id> | add codex <id> | add grok <id> | add antigravity <id> [--paid] | add opencode <id> <provider/model> | add api <id> <provider> <model> [--limit <usd> <period>] [--paid]"
+    if args == ["providers"]:  # Frugal Deck's and the skill's picker for add api: providers OpenCode can reach with a key, models that call tools
+        rows = []
+        for pid, p in catalog().items():
+            models = [{"id": mid, "name": m.get("name", mid), "input": (m.get("cost") or {}).get("input"), "output": (m.get("cost") or {}).get("output")}
+                      for mid, m in (p.get("models") or {}).items() if m.get("tool_call")]
+            if p.get("env") and models:
+                rows.append({"id": pid, "name": p.get("name", pid), "env": p["env"][0], "models": models})
+        return json.dumps(sorted(rows, key=lambda r: r["name"].lower()))
+    if args[0] == "limit" and (len(args) == 4 or args[2:] == ["off"]):
+        a = next((a for a in data["accounts"] if a["id"] == args[1] and a["kind"] == "api"), None)
+        if not a:
+            raise SystemExit(f"No api account {args[1]}.")
+        if args[2] == "off":
+            a.pop("spend_limit", None)
+            a.pop("spend_period", None)
+        else:
+            a["spend_limit"], a["spend_period"] = spend_limit(args[2], args[3]), args[3]
+        save(data)
+        return f"{a['id']}: ${a['spend_limit']:.2f} per {a['spend_period']}." if "spend_limit" in a else f"{a['id']}: no spend limit."
     if args == ["ranking"]:  # Frugal Deck's order panel
         stats, mode = job_stats(), "custom" if data.get("order_mode") == "custom" else "recommended"
         return json.dumps([{"id": a["id"], "kind": a["kind"], "tries": t, "ok": k, "rate": round((k + 1) / (t + 2), 2), "mode": mode}
@@ -1616,33 +1785,33 @@ def cli(args):
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
             raise SystemExit(f"No account {args[1]}.")
+        if a.get("kind") not in RULES:
+            raise SystemExit(f"{a['id']} has unsupported kind {a.get('kind')}: remove it.")
         if args[0] == "login-command":
             return json.dumps(login_command(a))
         ok = logged_in(a)[0]
         if ok and a.pop("needs_login", None):
             save(data)  # Deck signs in in its own terminal; status puts that account back in the pool.
-        return json.dumps({"id": a["id"], "kind": a["kind"], "installed": bool(which("agy" if a["kind"] == "antigravity" else a["kind"])), "loggedIn": ok})
-    if args[:2] == ["add", "gemini"] and "--google" in args[3:]:
-        raise SystemExit("Gemini CLI no longer serves personal Google accounts (ended 2026-06-18). Sign in with Google through Antigravity: "
-                         "add antigravity <id> [--paid]; or add a Gemini API key: add gemini <id> [--paid]")
-    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == (4 if args[1] == "opencode" else 3) or args[1] in ("gemini", "antigravity") and args[3:] == ["--paid"]):
+        return json.dumps({"id": a["id"], "kind": a["kind"], "installed": bool(which("agy" if a["kind"] == "antigravity" else agent(a["kind"]))), "loggedIn": ok})
+    if args[0] == "add" and len(args) >= 3 and args[1] in RULES and (len(args) == {"opencode": 4}.get(args[1], 3) or args[1] == "antigravity" and args[3:] == ["--paid"]
+                                                                     or args[1] == "api" and len(args) >= 5 and api_flags(args[5:])):
         kind, aid = args[1], args[2]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", aid):
             raise SystemExit("Account id must contain only letters, numbers, underscores or hyphens.")
         existing = next((a for a in data["accounts"] if a["id"] == aid), None)
-        if existing and not (kind == existing["kind"] == "gemini"):
+        if existing and not (kind == existing["kind"] == "api"):  # re-adding a key replaces it
             raise SystemExit(f"{aid} is already set up.")
-        if not which("agy" if kind == "antigravity" else kind):
+        if not which("agy" if kind == "antigravity" else agent(kind)):
             npm = shutil.which("npm")
             if not npm and kind != "antigravity":
                 raise SystemExit("Install Node.js (https://nodejs.org) first, then try again.")
-            print(f"Installing {PACKAGES[kind]}...", flush=True)
-            r = subprocess.run(AGY_INSTALL if kind == "antigravity" else [npm, "install", "-g", PACKAGES[kind]], stdin=subprocess.DEVNULL)
+            print(f"Installing {PACKAGES[agent(kind)]}...", flush=True)
+            r = subprocess.run(AGY_INSTALL if kind == "antigravity" else [npm, "install", "-g", PACKAGES[agent(kind)]], stdin=subprocess.DEVNULL)
             if r.returncode:
                 raise SystemExit(r.returncode)
             data = load()
             existing = next((a for a in data["accounts"] if a["id"] == aid), None)
-            if existing and not (kind == existing["kind"] == "gemini"):
+            if existing and not (kind == existing["kind"] == "api"):
                 raise SystemExit(f"{aid} is already set up.")
         a = {"id": aid, "kind": kind, "enabled": True, "used": 0, "day": ""}
         if kind == "claude":
@@ -1656,40 +1825,48 @@ def cli(args):
         elif kind == "antigravity":
             a["home"], a["paid"] = str(DIR / f"antigravity-{aid}"), "--paid" in args[3:]
             Path(a["home"]).mkdir(parents=True, exist_ok=True)
-        elif kind == "gemini":
-            key = sys.stdin.readline().rstrip("\r\n")
-            if not key or not key.isprintable() or any(c.isspace() for c in key):
-                raise SystemExit("Gemini API key must be non-empty printable text without spaces.")
-            a["home"], a["paid"] = str(DIR / f"gemini-{aid}"), "--paid" in args[3:]
-            path = Path(a["home"]) / ".gemini" / ".env"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = None
-            try:
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
-                    tmp = Path(f.name)
-                    if os.name != "nt":
-                        os.chmod(tmp, 0o600)
-                    f.write(f"GEMINI_API_KEY={key}\n")
-                os.replace(tmp, path)
-            finally:
-                if tmp is not None:
-                    tmp.unlink(missing_ok=True)
+        elif kind == "api":
+            key, (provider, model), (limit, paid) = read_key("API key"), args[3:5], api_flags(args[5:])
+            p = catalog().get(provider)
+            if not p or not p.get("env"):
+                raise SystemExit(f"Unknown provider {provider}; list them with: providers")
+            if not ((p.get("models") or {}).get(model) or {}).get("tool_call"):
+                raise SystemExit(f"{provider} has no model {model} that can call tools; list them with: providers")
+            if paid and provider != "google":
+                raise SystemExit("--paid applies only to provider google: Google trains on free-tier API traffic, and a key with billing on is the paid tier.")
+            a.update(provider=provider, model=f"{provider}/{model}", data_dir=str(DIR / f"api-{aid}"))
+            if provider == "google":
+                a["paid"] = paid
+            if limit:
+                a["spend_limit"], a["spend_period"] = spend_limit(*limit), limit[1]
+            if existing and existing.get("spend"):
+                a["spend"] = existing["spend"]  # a new key or limit keeps what the period already spent
+            write_private(Path(a["data_dir"]) / "key", key + "\n")
         elif kind == "opencode":
             a["model"], a["data_dir"] = args[3], str(DIR / f"opencode-{aid}")
-            if blocked(a, data):
-                raise SystemExit(f"{args[3]} may train on what it receives, so frugal blocks it. "
-                        "To allow such models, run: opencode-training on")
-        if kind not in ("opencode", "gemini"):
+        if kind not in ("opencode", "api"):
             a["needs_login"] = True  # out of the pool until login() confirms it
         data["accounts"] = [x for x in data["accounts"] if x["id"] != aid] + [a]
         save(data)
         PENDING.append(a)
         return f"Added {aid}." + (f" Blocked: {training_message(a)}." if blocked(a, data) else "")
-    if args[0] == "opencode-training" and args[1:] in (["on"], ["off"]):
-        data["opencode_allow_training"] = args[1] == "on"
-        save(data)
-        return ("OpenCode models that may train on your data are now allowed." if args[1] == "on"
-                else "OpenCode models that may train on your data are blocked.")
+    if args[0] == "opencode-training" and args[1:] in (["on"], ["off"]):  # the old command
+        args = ["training", "all" if args[1] == "on" else "off"]
+    if args[0] == "training":
+        candidates = {a["id"]: a for a in data["accounts"] if a.get("kind") in RULES and may_train(a)}
+        if len(args) == 1:
+            return json.dumps({"mode": data.get("training", "off"), "allowed": data.get("training_allowed", []),
+                               "candidates": [{"id": a["id"], "kind": a["kind"], "model": a.get("model"), "reason": train_reason(a)} for a in candidates.values()]})
+        if args[1:] in (["off"], ["all"]) or args[1] == "some" and len(args) > 2:
+            if (unknown := [i for i in args[2:] if i not in candidates]):
+                raise SystemExit(f"{', '.join(unknown)}: no account that may train has that id; list them with: training")
+            data["training"], ids = args[1], list(dict.fromkeys(args[2:]))
+            data.pop("training_allowed", None)
+            if ids:
+                data["training_allowed"] = ids
+            save(data)
+            return {"off": "Accounts that may train on your data are blocked.", "all": "Accounts that may train on your data are allowed.",
+                    "some": f"Allowed to train: {', '.join(ids)}; other accounts that may train stay blocked."}[args[1]]
     if args[0] == "remove" and len(args) == 2:
         data["accounts"] = [a for a in data["accounts"] if a["id"] != args[1]]
         save(data)
@@ -1698,6 +1875,8 @@ def cli(args):
         a = next((a for a in data["accounts"] if a["id"] == args[1]), None)
         if not a:
             raise SystemExit(f"No account {args[1]}.")
+        if a.get("kind") not in RULES:
+            raise SystemExit(f"{a['id']} has unsupported kind {a.get('kind')}: remove it.")
         PENDING.append(a)
         return f"Signing in {a['id']}."
     raise SystemExit(__doc__)
@@ -1723,19 +1902,19 @@ def selftest():
     finally:
         globals()["codex_models"] = saved_codex_models
     now = time.time()
-    pool = [{"id": "a", "used": 5, "day": today()}, {"id": "b", "used": 1, "day": today()}, {"id": "off", "enabled": False},
-            {"id": "lim", "exhausted_until": now + 60}, {"id": "old", "used": 9, "day": "2000-01-01"}]
+    pool = [{"id": "a", "kind": "claude", "used": 5, "day": today()}, {"id": "b", "kind": "claude", "used": 1, "day": today()}, {"id": "off", "kind": "claude", "enabled": False},
+            {"id": "lim", "kind": "claude", "exhausted_until": now + 60}, {"id": "old", "kind": "claude", "used": 9, "day": "2000-01-01"}]
     assert [a["id"] for a in order(pool, {})] == ["old", "b", "a"]
-    assert [a["id"] for a in ready([{"id": "out", "needs_login": True}, {"id": "in"}])] == ["in"]
+    assert [a["id"] for a in ready([{"id": "out", "kind": "codex", "needs_login": True}, {"id": "in", "kind": "codex"}, {"id": "nokind"}])] == ["in"]
     saved = {k: os.environ.pop(k, None) for k in ("CLAUDE_CONFIG_DIR", ROLES)}
-    mine = [{"id": "me", "config_dir": str(HOME / ".claude-me") + os.sep}, {"id": "x", "config_dir": str(HOME / ".claude-x")}, {"id": "cx"}]
+    mine = [{"id": "me", "kind": "claude", "config_dir": str(HOME / ".claude-me") + os.sep}, {"id": "x", "kind": "claude", "config_dir": str(HOME / ".claude-x")}, {"id": "cx", "kind": "codex"}]
     os.environ["CLAUDE_CONFIG_DIR"] = str(HOME / ".claude-me")
     assert "CLAUDE_CONFIG_DIR" not in child_env({"config_dir": str(HOME / ".claude")}) and child_env({"config_dir": str(HOME / ".claude-x")})["CLAUDE_CONFIG_DIR"] == str(HOME / ".claude-x")
     assert [a["id"] for a in ready(mine)] == ["x", "cx"]
     os.environ[ROLES] = "off"
     assert len(ready(mine)) == 3
     del os.environ["CLAUDE_CONFIG_DIR"], os.environ[ROLES]
-    assert [a["id"] for a in ready([{"id": "main", "config_dir": str(HOME / ".claude")}, {"id": "cx"}])] == ["cx"]
+    assert [a["id"] for a in ready([{"id": "main", "kind": "claude", "config_dir": str(HOME / ".claude")}, {"id": "cx", "kind": "codex"}])] == ["cx"]
     os.environ.update({k: v for k, v in saved.items() if v is not None})
     assert AUTH.search("API Error: 401 OAuth token has expired") and AUTH.search("Please run /login") and not AUTH.search("ok")
     msg = "You've hit your 5-hour limit · resets 11:30am (America/Lima)"
@@ -1750,7 +1929,8 @@ def selftest():
     assert [a["id"] for a in order(mixed, {"x": 1}, "heavy")] == ["g", "c", "x"]
     mixed[2]["slow_day"] = today()
     assert [a["id"] for a in order(mixed, {}, "heavy")] == ["g", "c", "x"] and order(mixed, {}, "standard")[0]["id"] == "o"
-    assert [a["id"] for a in order([{"id": "gm", "kind": "gemini"}, {"id": "ag", "kind": "antigravity"}, {"id": "c", "kind": "claude"}], {}, "heavy")] == ["c", "ag", "gm"]
+    assert [a["id"] for a in order([{"id": "ap", "kind": "api"}, {"id": "ag", "kind": "antigravity"}, {"id": "c", "kind": "claude"}], {}, "heavy")] == ["c", "ag"]
+    assert [a["id"] for a in order([{"id": "zz", "kind": "teleport"}, {"id": "c", "kind": "claude"}], {})] == ["c"]  # an unknown kind never enters the pool
     mixed = [{"id": "g", "kind": "grok", "used": 0, "day": today()}, {"id": "x", "kind": "codex", "used": 5, "day": today()}]
     assert order(mixed, {}, level="standard")[0]["id"] == "x" and order(mixed, {}, level="heavy")[0]["id"] == "g"
     saved_jobs = JOBS
@@ -1791,71 +1971,52 @@ def selftest():
     assert choose(oc, "search", "max") == ("opencode/glm-5.3-flash-free", "high") and account_env(oc) == {"XDG_DATA_HOME": "/d"}
     assert argv_for(oc, "search", *choose(oc, "search"))[-6:] == ["medium", "--agent", "plan", "--auto", "--format", "json"] and "build" in argv_for(oc, "edit", "m", "low")
     pickle = {"kind": "opencode", "model": "opencode/big-pickle"}
-    assert blocked(pickle, {}) and not blocked(pickle, {"opencode_allow_training": True}) and not blocked(oc, {})
+    assert blocked(pickle, {}) and not blocked(pickle, {"training": "all"}) and not blocked(oc, {}) and not may_train(oc)
+    goog, ag0 = {"id": "gf", "kind": "api", "provider": "google", "model": "google/f"}, {"id": "ag0", "kind": "antigravity"}
+    assert may_train(goog) and may_train(ag0) and not may_train({**goog, "paid": True}) and not may_train({**ag0, "paid": True})
+    assert not may_train({"id": "p", "kind": "api", "provider": "prov"}) and not blocked({**goog, "paid": True}, {})
+    some = {"training": "some", "training_allowed": ["gf"]}
+    for mode, gf, ag in (({}, True, True), ({"training": "off"}, True, True), ({"training": "all"}, False, False), (some, False, True), ({"training": "some"}, True, True)):
+        assert (blocked(goog, mode), blocked(ag0, mode)) == (gf, ag), mode
+    assert "training some gf" in training_message(goog) and "--paid" in training_message(goog) and "Frugal Deck Settings" in training_message(ag0)
     assert not blocked({"kind": "opencode", "model": "openrouter/nvidia/nemotron-x"}, {})
+    assert not blocked({"kind": "api", "model": "opencode/big-pickle"}, {})  # a paid key is not Zen's free tier
+    d = datetime.date
+    assert [period_start(p, d(2026, 11, 26)) for p in PERIODS] == ["2026-11-26", "2026-11-23", "2026-11-01", "2026-10-01", "2026-01-01"]
+    assert [period_start("week", d(2026, 11, n)) for n in (23, 29, 30)] == ["2026-11-23", "2026-11-23", "2026-11-30"]
+    assert period_start("week", d(2027, 1, 1)) == "2026-12-28" and period_start("day") == today() and period_start("month") == today()[:8] + "01"
+    assert [period_start("quarter", d(2026, m, n)) for m, n in ((1, 1), (3, 31), (4, 1), (6, 30), (7, 1), (9, 30), (10, 1), (12, 31))] == [
+        "2026-01-01", "2026-01-01", "2026-04-01", "2026-04-01", "2026-07-01", "2026-07-01", "2026-10-01", "2026-10-01"]
+    ap = {"id": "ap", "kind": "api", "spend_limit": 1.0, "spend_period": "week"}
+    add_spend(ap, 0.5, d(2026, 11, 23))
+    add_spend(ap, 0.25, d(2026, 11, 29))
+    assert ap["spend"] == {"since": "2026-11-23", "usd": 0.75} and spent(ap, d(2026, 11, 30)) == 0
+    add_spend(ap, 0.125, d(2026, 11, 30))
+    assert ap["spend"] == {"since": "2026-11-30", "usd": 0.125}  # a new week starts from 0
+    ap["spend"] = {"since": period_start("week"), "usd": 1.0}
+    assert ready([ap]) == [] and over_limit(ap)
+    assert ready([{**ap, "spend": {"since": period_start("week"), "usd": 0.99}}]) and ready([{**ap, "spend": {"since": "2000-01-03", "usd": 9}}])
+    assert ready([{"id": "ap", "kind": "api", "spend": {"since": period_start("month"), "usd": 99}}])  # no limit, no cap
+    assert ready([{"id": "oc", "kind": "opencode", "spend_limit": 0, "spend": {"since": period_start("month"), "usd": 1}}])
+    paid = [{"id": "ap", "kind": "api"}, {"id": "x", "kind": "codex", "used": 3, "day": today()}]
+    assert [a["id"] for a in order(paid, {}, "standard")] == ["x", "ap"] and [a["id"] for a in order(paid, {}, "standard", {"order_mode": "custom", "order": ["ap"]})] == ["ap", "x"]
     assert argv_for(codex, "edit", None, "low", ["serviceminder"])[-5:-3] == ["-c", "mcp_servers.serviceminder.enabled=false"]
     # New providers and Deck commands stay isolated from the machine's accounts and keys.
     import io
     g = globals()
-    real = {k: g[k] for k in ("DIR", "FILE", "PENDING", "GEMINI_MODELS", "AGY_MODELS", "run_tree")}
-    saved_which, saved_run, saved_stdin = shutil.which, subprocess.run, sys.stdin
-    saved_key = os.environ.get("GEMINI_API_KEY")
+    keys = ("GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY", "FRUGALTEST_PROV_KEY", "FRUGALTEST_PROV_ALT")
+    real = {k: g[k] for k in ("DIR", "FILE", "PENDING", "AGY_MODELS", "run_tree", "catalog", "CATALOG_DOWN")}
+    saved_which, saved_run, saved_stdin, saved_urlopen = shutil.which, subprocess.run, sys.stdin, urllib.request.urlopen
+    saved_keys = {k: os.environ.get(k) for k in keys}
     try:
         with tempfile.TemporaryDirectory() as folder:
-            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[], GEMINI_MODELS=None, AGY_MODELS=None)
+            g.update(DIR=Path(folder), FILE=Path(folder) / "accounts.json", PENDING=[], AGY_MODELS=None)
             shutil.which = lambda name: name + ".cmd"
             calls = []
-            def models_cli(argv, timeout, **kw):
-                calls.append(argv)
-                return 0, "auto\ngemini-2.5-pro\ngemini-3.5-flash\ngemini-2.5-flash\ngemini-3.1-flash-lite\ngemini-9.0-flash-preview\n  Description: supersedes gemini-8.0-flash\n", ""
-            g["run_tree"] = models_cli
-            gemini = {"id": "gem", "kind": "gemini"}
-            assert choose(gemini, "search", "light") == ("gemini-3.1-flash-lite", None)
-            assert choose(gemini, "search", "standard", "max") == ("gemini-3.5-flash", None)
-            assert choose(gemini, "edit", "heavy") == choose(gemini, "edit", "max") == ("auto", None)
-            assert calls == [["gemini.cmd", "models", "list"]]  # cached once per process
-            g["GEMINI_MODELS"] = []
-            assert choose(gemini, "search", "light") == choose(gemini, "search", "standard") == ("auto", None)
-            for kind in ("search", "note", "edit", "run"):
-                assert argv_for(gemini, kind, "auto", None) == ["gemini", "-p", "Follow the brief on stdin.", "-o", "json", "--approval-mode",
-                                                                "plan" if kind in ("search", "note") else "yolo", "-m", "auto"]
-            sys.stdin = io.StringIO("k1\nignored-second-line\n")
-            assert "free tier" in cli(["add", "gemini", "gem"])
-            gemini = load()["accounts"][0]
-            key_file = DIR / "gemini-gem" / ".gemini" / ".env"
-            assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=k1\n" and logged_in(gemini) == (True, None)
-            if os.name != "nt":
-                assert key_file.stat().st_mode & 0o777 == 0o600
-            assert account_env(gemini) == {"GEMINI_CLI_HOME": str(DIR / "gemini-gem")}
-            os.environ["GEMINI_API_KEY"] = "k0"
-            assert child_env(gemini)["GEMINI_API_KEY"] == "k1"
-            assert "GEMINI_API_KEY" not in child_env({**gemini, "home": str(DIR / "missing")})
-            assert blocked(gemini, {}) and not blocked(gemini, {"opencode_allow_training": True})
-            assert json.loads(cli(["status", "gem"])) == {"id": "gem", "kind": "gemini", "installed": True, "loggedIn": True}
-            assert json.loads(cli(["login-command", "gem"])) == {"argv": None, "env": account_env(gemini)}
-            sys.stdin = io.StringIO("paid-test-key\n")
-            cli(["add", "gemini", "gem", "--paid"])
-            assert len(load()["accounts"]) == 1 and not blocked(load()["accounts"][0], {})
-            for key in ("", " ", "bad key", "bad\tkey", "bad\x00key"):
-                sys.stdin = io.StringIO(key + "\n")
-                try:
-                    cli(["add", "gemini", "gem", "--paid"])
-                    raise AssertionError("Invalid Gemini key accepted")
-                except SystemExit as e:
-                    assert str(e) == "Gemini API key must be non-empty printable text without spaces."
-                assert key_file.read_text(encoding="utf-8") == "GEMINI_API_KEY=paid-test-key\n"
-            key_file.write_text("GEMINI_API_KEY=\n", encoding="utf-8")
-            assert logged_in(gemini) == (False, None)
-            # Gemini's Google sign-in ended 2026-06-18: refused, and a leftover Google account reads as logged out.
-            try:
-                cli(["add", "gemini", "gg", "--google"])
-                raise AssertionError("Gemini Google sign-in accepted")
-            except SystemExit as e:
-                assert "add antigravity" in str(e)
+            quiet = lambda argv, timeout, **kw: (0, "", "")  # no CLI runs for real
+            g["run_tree"] = quiet
             assert AUTH.search("This client is no longer supported for Gemini Code Assist for individuals") and AUTH.search("IneligibleTier")
-            leftover = {"id": "gg", "kind": "gemini", "auth": "google", "home": str(DIR / "gemini-gg")}
-            assert logged_in(leftover) == (False, None) and login_command(leftover)["argv"] is None
-            for bad in (["add", "gemini", "gx", "--paid", "--paid"], ["add", "antigravity", "ax", "--google"], ["add", "antigravity", "ax", "--paid", "x"]):
+            for bad in (["add", "gemini", "gx"], ["add", "antigravity", "ax", "--google"], ["add", "antigravity", "ax", "--paid", "x"]):  # gemini: legacy kind, gone
                 try:
                     cli(bad)
                     raise AssertionError("Bad add arguments accepted")
@@ -1873,7 +2034,7 @@ def selftest():
             assert logged_in(ag) == (False, None)
             token.write_text("t", encoding="utf-8")
             assert json.loads(cli(["status", "ag"])) == {"id": "ag", "kind": "antigravity", "installed": True, "loggedIn": True}
-            assert blocked(ag, {}) and not blocked(ag, {"opencode_allow_training": True}) and "Antigravity" in training_message(ag)
+            assert blocked(ag, {}) and not blocked(ag, {"training": "all"}) and "Antigravity" in training_message(ag)
             cli(["add", "antigravity", "agp", "--paid"])
             assert not blocked(load()["accounts"][-1], {})
             cli(["remove", "agp"])
@@ -1883,12 +2044,12 @@ def selftest():
             g["run_tree"] = lambda argv, timeout, **kw: calls.append((argv, kw["env"]["HOME"])) or (0, agy_list, "Fetching available models...")
             assert [choose(ag, "edit", lv) for lv in LEVELS] == [("gemini-3.8-flash-low", None), ("gemini-3.8-flash-medium", None),
                                                                  ("gemini-4-hydrogen-high", None), ("gemini-4-hydrogen-xhigh", None)]
-            assert calls[1:] == [(["agy.cmd", "models"], home)]  # cached once per process
+            assert calls == [(["agy.cmd", "models"], home)]  # cached once per process
             g["AGY_MODELS"] = ["gemini-4-hydrogen-high", "gemini-3.8-flash-low"]
             assert choose(ag, "edit", "max") == ("gemini-4-hydrogen-high", None)
             g["AGY_MODELS"] = []
             assert choose(ag, "search", "light") == (None, None)
-            g["run_tree"] = models_cli
+            g["run_tree"] = quiet
             assert argv_for(ag, "search", "m", None) == ["agy", "-p", "Follow the brief on stdin.", "--output-format", "json", "--model", "m", "--mode", "plan", "--dangerously-skip-permissions"]
             assert argv_for(ag, "edit", None, None) == ["agy", "-p", "Follow the brief on stdin.", "--output-format", "json", "--dangerously-skip-permissions"]
             agjob = {}
@@ -1922,8 +2083,194 @@ def selftest():
             assert login_command(oc) == {"argv": None, "env": account_env(oc)}
             assert login_command({**oc, "model": "openrouter/test:free"})["argv"] is None
             assert login_command(claude) == {"argv": ["claude", "auth", "login"], "env": {}}
+            # api accounts: a key for a models.dev provider, run through OpenCode. The catalog is cached a day; offline, a stale copy serves.
+            stub = {"prov": {"id": "prov", "name": "Prov", "env": ["FRUGALTEST_PROV_KEY", "FRUGALTEST_PROV_ALT"], "models": {
+                        "m": {"name": "M", "tool_call": True, "cost": {"input": 1, "output": 2}}, "chat": {"name": "Chat", "tool_call": False},
+                        "nocost": {"name": "N", "tool_call": True}}},
+                    "keyless": {"id": "keyless", "name": "Keyless", "env": [], "models": {"m": {"name": "M", "tool_call": True}}},
+                    "notools": {"id": "notools", "name": "A notools", "env": ["X"], "models": {"c": {"name": "C", "tool_call": False}}},
+                    "abc": {"id": "abc", "name": "abc", "env": ["FRUGALTEST_ABC_KEY"], "models": {"z": {"name": "Z", "tool_call": True, "cost": {"input": 0.5}}}}}
+            fetches = []
+            def offline(req, timeout):
+                fetches.append(timeout)
+                raise OSError("offline")
+            urllib.request.urlopen = offline
+            try:
+                catalog()
+                raise AssertionError("Catalog without cache or network")
+            except SystemExit as e:
+                assert str(e) == "Could not load the model catalog from models.dev." and fetches == [20]
+            urllib.request.urlopen = lambda req, timeout: fetches.append(req.full_url) or io.BytesIO(json.dumps(stub).encode())
+            assert catalog() == stub and json.loads((DIR / "models.json").read_text(encoding="utf-8")) == stub and fetches[-1] == "https://models.dev/api.json"
+            urllib.request.urlopen = offline
+            assert catalog() == stub and len(fetches) == 2  # fresh: no fetch
+            os.utime(DIR / "models.json", (0, 0))
+            assert catalog() == stub and len(fetches) == 3
+            g["catalog"] = lambda: stub
+            assert json.loads(cli(["providers"])) == [
+                {"id": "abc", "name": "abc", "env": "FRUGALTEST_ABC_KEY", "models": [{"id": "z", "name": "Z", "input": 0.5, "output": None}]},
+                {"id": "prov", "name": "Prov", "env": "FRUGALTEST_PROV_KEY", "models": [{"id": "m", "name": "M", "input": 1, "output": 2},
+                                                                                         {"id": "nocost", "name": "N", "input": None, "output": None}]}]
+            limit_msg = "Limit must be a positive USD amount per day, week, month, quarter, year."
+            for bad, msg in ((["nope", "m"], "Unknown provider nope; list them with: providers"), (["keyless", "m"], "Unknown provider keyless; list them with: providers"),
+                             (["prov", "chat"], "prov has no model chat that can call tools; list them with: providers"),
+                             (["prov", "gone"], "prov has no model gone that can call tools; list them with: providers"),
+                             *((["prov", "m", "--limit", usd, "day"], limit_msg) for usd in ("0", "-1", "x", "nan", "inf")),
+                             (["prov", "m", "--limit", "5", "decade"], limit_msg), (["prov", "m", "--cap", "5", "day"], __doc__),
+                             (["prov", "m", "--limit", "5"], __doc__), (["prov"], __doc__)):
+                sys.stdin = io.StringIO("sk-test\n")
+                try:
+                    cli(["add", "api", "ap", *bad])
+                    raise AssertionError(f"Bad add api accepted: {bad}")
+                except SystemExit as e:
+                    assert str(e) == msg, (bad, str(e))
+            for key in ("", " ", "bad key", "bad\tkey", "bad\x00key"):
+                sys.stdin = io.StringIO(key + "\n")
+                try:
+                    cli(["add", "api", "ap", "prov", "m"])
+                    raise AssertionError("Invalid API key accepted")
+                except SystemExit as e:
+                    assert str(e) == "API key must be non-empty printable text without spaces."
+            assert not any(a["id"] == "ap" for a in load()["accounts"]) and not (DIR / "api-ap").exists()
+            sys.stdin = io.StringIO("sk-1\nignored\n")
+            assert cli(["add", "api", "ap", "prov", "m", "--limit", "5", "week"]) == "Added ap."
+            ap = next(a for a in load()["accounts"] if a["id"] == "ap")
+            assert {k: ap[k] for k in ("kind", "provider", "model", "data_dir", "spend_limit", "spend_period")} == {
+                "kind": "api", "provider": "prov", "model": "prov/m", "data_dir": str(DIR / "api-ap"), "spend_limit": 5.0, "spend_period": "week"}
+            assert "needs_login" not in ap and logged_in(ap) == (True, None) and (DIR / "api-ap" / "key").read_text(encoding="utf-8") == "sk-1\n"
+            assert json.loads(cli(["login-command", "ap"])) == {"argv": None, "env": {"XDG_DATA_HOME": ap["data_dir"]}}
+            assert choose(ap, "edit", "max") == ("prov/m", "high") and argv_for(ap, "search", "prov/m", "low")[:6] == ["opencode", "run", "-m", "prov/m", "--variant", "low"]
+            os.environ.update(FRUGALTEST_PROV_KEY="parent", FRUGALTEST_PROV_ALT="parent2")
+            env = child_env(ap)
+            assert env["FRUGALTEST_PROV_KEY"] == env["FRUGALTEST_PROV_ALT"] == "sk-1" and env["XDG_DATA_HOME"] == ap["data_dir"]
+            assert "OPENCODE_CONFIG_CONTENT" in mcp_for("api", {"py": {"url": "https://p/"}}, {"py": []})[1]
+            data = load()
+            next(a for a in data["accounts"] if a["id"] == "ap")["spend"] = {"since": period_start("week"), "usd": 1.5}
+            save(data)
+            assert "ap: api prov/m, used today 0, $1.50 / $5.00 per week" in cli(["list"]).splitlines()
+            sys.stdin = io.StringIO("sk-2\n")
+            cli(["add", "api", "ap", "abc", "z"])  # re-adding replaces the key, model and limit, and keeps the spend
+            ap = [a for a in load()["accounts"] if a["id"] == "ap"]
+            assert len(ap) == 1 and ap[0]["model"] == "abc/z" and "spend_limit" not in ap[0] and ap[0]["spend"]["usd"] == 1.5, ap
+            assert (DIR / "api-ap" / "key").read_text(encoding="utf-8") == "sk-2\n"
+            assert f"ap: api abc/z, used today 0, ${1.5 if period_start('week') == period_start('month') else 0:.2f} this month" in cli(["list"]).splitlines()
+            assert cli(["limit", "ap", "3", "day"]) == "ap: $3.00 per day." and next(a for a in load()["accounts"] if a["id"] == "ap")["spend_period"] == "day"
+            assert cli(["limit", "ap", "off"]) == "ap: no spend limit." and "spend_limit" not in next(a for a in load()["accounts"] if a["id"] == "ap")
+            for bad, msg in ((["gem", "3", "day"], "No api account gem."), (["ap", "0", "day"], limit_msg), (["ap", "3"], __doc__), (["ap", "on"], __doc__)):
+                try:
+                    cli(["limit", *bad])
+                    raise AssertionError(f"Bad limit accepted: {bad}")
+                except SystemExit as e:
+                    assert str(e) == msg, (bad, str(e))
+            (DIR / "api-ap" / "key").write_text("\n", encoding="utf-8")
+            assert logged_in(ap[0]) == (False, None) and "FRUGALTEST_ABC_KEY" not in child_env(ap[0])
+            cli(["remove", "ap"])
+            # --paid: Google only, where a key with billing on is the paid tier; --limit and --paid in any order.
+            google = {"google": {"id": "google", "name": "Google", "env": ["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY"], "models": {
+                "gemini-3.5-flash": {"tool_call": True, "release_date": "2026-05-01"}, "gemini-3.8-flash": {"tool_call": True, "release_date": "2026-09-01"},
+                "gemini-3.9-flash-lite": {"tool_call": True, "release_date": "2026-10-01"}, "gemini-4-flash-preview": {"tool_call": True, "release_date": "2026-11-01"},
+                "gemini-4.1-flash-image": {"tool_call": True, "release_date": "2026-11-02"}, "gemini-4-flash-live": {"tool_call": True, "release_date": "2026-11-03"},
+                "gemini-4-flash-tts": {"tool_call": True, "release_date": "2026-11-04"}, "gemini-4-flash-exp": {"tool_call": True, "release_date": "2026-11-05"},
+                "gemini-5-flash": {"tool_call": False, "release_date": "2026-11-20"}, "gemini-4-pro": {"tool_call": True, "release_date": "2026-11-10"}}}}
+            assert gemini_flash(google["google"]["models"]) == "gemini-3.8-flash"
+            assert gemini_flash({"gemini-4-flash-preview": {"release_date": "2026-11-01"}, "gemini-3-flash-lite": {"tool_call": True, "release_date": "2026-01-01"}}) == "gemini-4-flash-preview"
+            assert gemini_flash({"gemini-4-pro": {"tool_call": True}}) is None
+            g["catalog"] = lambda: {**stub, **google}
+            for i, flags in enumerate((["--paid", "--limit", "5", "day"], ["--limit", "5", "day", "--paid"])):
+                sys.stdin = io.StringIO("gk\n")
+                assert cli(["add", "api", f"gp{i}", "google", "gemini-3.8-flash", *flags]) == f"Added gp{i}."
+                gp = next(a for a in load()["accounts"] if a["id"] == f"gp{i}")
+                assert gp["paid"] is True and gp["spend_limit"] == 5.0 and gp["spend_period"] == "day" and not blocked(gp, load())
+            sys.stdin = io.StringIO("gk\n")
+            assert "Blocked: Google trains on free-tier API traffic" in cli(["add", "api", "gu", "google", "gemini-3.8-flash"])
+            gu = next(a for a in load()["accounts"] if a["id"] == "gu")
+            assert gu["paid"] is False and blocked(gu, load()) and ", blocked: Google trains on free-tier API traffic (allow it with: training all, or training some gu" in cli(["list"])
+            os.environ.update(GEMINI_API_KEY="parent", GOOGLE_API_KEY="parent")
+            assert all(child_env(gu)[k] == "gk" for k in google["google"]["env"])  # every name: OpenCode picks one in its own order
+            for bad, msg in ((["prov", "m", "--paid"], "--paid applies only to provider google: Google trains on free-tier API traffic, and a key with billing on is the paid tier."),
+                             (["google", "gemini-3.8-flash", "--paid", "--paid"], __doc__), (["google", "gemini-3.8-flash", "--limit", "5", "day", "--limit", "5", "day"], __doc__)):
+                sys.stdin = io.StringIO("gk\n")
+                try:
+                    cli(["add", "api", "gx", *bad])
+                    raise AssertionError(f"Bad --paid accepted: {bad}")
+                except SystemExit as e:
+                    assert str(e) == msg, (bad, str(e))
+            sys.stdin = io.StringIO("sk\n")
+            cli(["add", "api", "pv", "prov", "m"])
+            assert "paid" not in next(a for a in load()["accounts"] if a["id"] == "pv") and not may_train(next(a for a in load()["accounts"] if a["id"] == "pv"))
+            # Training permission: candidates are the accounts that may train; some lists the allowed ones.
+            sys.stdin = io.StringIO("")
+            cli(["add", "opencode", "pk", "opencode/big-pickle"])  # added, blocked until training allows it
+            reason_pk = "this OpenCode Zen model may train on what it receives"
+            assert json.loads(cli(["training"])) == {"mode": "off", "allowed": [], "candidates": [
+                {"id": "ag", "kind": "antigravity", "model": None, "reason": "Antigravity collects interactions for training by default"},
+                {"id": "gu", "kind": "api", "model": "google/gemini-3.8-flash", "reason": "Google trains on free-tier API traffic"},
+                {"id": "pk", "kind": "opencode", "model": "opencode/big-pickle", "reason": reason_pk}]}
+            assert cli(["training", "some", "gu", "pk", "gu"]) == "Allowed to train: gu, pk; other accounts that may train stay blocked."
+            data = load()
+            assert data["training"] == "some" and data["training_allowed"] == ["gu", "pk"] and not blocked(gu, data) and blocked(ag, data)
+            assert json.loads(cli(["training"]))["allowed"] == ["gu", "pk"]
+            for bad, msg in ((["some", "gp0"], "gp0: no account that may train has that id; list them with: training"),
+                             (["some", "gu", "ghost"], "ghost: no account that may train has that id; list them with: training"),
+                             (["some"], __doc__), (["maybe"], __doc__), (["all", "gu"], __doc__)):
+                try:
+                    cli(["training", *bad])
+                    raise AssertionError(f"Bad training accepted: {bad}")
+                except SystemExit as e:
+                    assert str(e) == msg, (bad, str(e))
+            assert load()["training_allowed"] == ["gu", "pk"]
+            assert cli(["training", "all"]) == "Accounts that may train on your data are allowed."
+            assert load()["training"] == "all" and "training_allowed" not in load() and not blocked(ag, load())
+            assert cli(["opencode-training", "off"]) == "Accounts that may train on your data are blocked." and load()["training"] == "off"
+            cli(["opencode-training", "on"])
+            assert load()["training"] == "all"
+            cli(["training", "off"])
+            for x in ("gp0", "gp1", "gu", "pv", "pk"):
+                cli(["remove", x])
+            # Legacy Gemini CLI accounts migrate on load: one with a key to an api account on Google, keeping its generic fields.
+            legacy_home = DIR / "gemini-lg"
+            write_private(legacy_home / ".gemini" / ".env", "GEMINI_API_KEY=lk\n")
+            write_private(DIR / "gemini-lf" / ".gemini" / ".env", "OTHER=1\nGEMINI_API_KEY=fk\n")
+            write_private(DIR / "gemini-nk" / ".gemini" / ".env", "GEMINI_API_KEY=\n")
+            data = load()
+            data["opencode_allow_training"] = True
+            data["accounts"] += [{"id": "lg", "kind": "gemini", "home": str(legacy_home), "paid": True, "enabled": True, "used": 4, "day": today()},  # legacy
+                                 {"id": "lf", "kind": "gemini", "home": str(DIR / "gemini-lf"), "auth": "key"},  # legacy, no paid field
+                                 {"id": "nk", "kind": "gemini", "home": str(DIR / "gemini-nk")},  # legacy, no key
+                                 {"id": "zz", "kind": "teleport"}]
+            save(data)
+            def down():
+                raise SystemExit("Could not load the model catalog from models.dev.")
+            g["catalog"] = down
+            data = load()  # the catalog is down: the training flag migrates, the legacy accounts wait
+            assert data == json.loads(FILE.read_text(encoding="utf-8")) and data["training"] == "all" and "opencode_allow_training" not in data
+            assert [a["kind"] for a in data["accounts"][-4:]] == ["gemini", "gemini", "gemini", "teleport"] and CATALOG_DOWN  # legacy kinds kept
+            g.update(catalog=lambda: google, CATALOG_DOWN=False)
+            data = load()
+            assert data["accounts"][-4:] == [
+                {"id": "lg", "kind": "api", "provider": "google", "model": "google/gemini-3.8-flash", "data_dir": str(DIR / "api-lg"), "paid": True, "enabled": True, "used": 4, "day": today()},
+                {"id": "lf", "kind": "api", "provider": "google", "model": "google/gemini-3.8-flash", "data_dir": str(DIR / "api-lf"), "paid": False},
+                {"id": "nk", "kind": "gemini", "home": str(DIR / "gemini-nk")}, {"id": "zz", "kind": "teleport"}], data["accounts"]  # legacy left as is
+            assert (DIR / "api-lg" / "key").read_text(encoding="utf-8") == "lk\n" and (DIR / "api-lf" / "key").read_text(encoding="utf-8") == "fk\n"
+            assert child_env(data["accounts"][-4])["GOOGLE_GENERATIVE_AI_API_KEY"] == "lk" and logged_in(data["accounts"][-3]) == (True, None)
+            before, mtime = FILE.read_text(encoding="utf-8"), FILE.stat().st_mtime_ns
+            assert load() == data and FILE.read_text(encoding="utf-8") == before and FILE.stat().st_mtime_ns == mtime  # idempotent: no second save
+            assert not {"nk", "zz"} & {a["id"] for a in ready(data["accounts"])} and {"lg", "lf"} <= {a["id"] for a in ready(data["accounts"])}
+            rows = cli(["list"]).splitlines()
+            assert "nk (unsupported kind gemini: remove it)" in rows and "zz (unsupported kind teleport: remove it)" in rows  # legacy
+            assert [c["id"] for c in json.loads(cli(["training"]))["candidates"]] == ["ag", "lf"]
+            for cmd in ("status", "login-command", "login"):
+                try:
+                    cli([cmd, "nk"])
+                    raise AssertionError("Unsupported account used")
+                except SystemExit as e:
+                    assert str(e) == "nk has unsupported kind gemini: remove it.", str(e)  # legacy
+            assert "nk" not in why_none(data, [], "standard")
+            data.pop("training")
+            save({**data, "opencode_allow_training": False})
+            assert load() == data and json.loads(FILE.read_text(encoding="utf-8")) == data and blocked(ag, data)  # an old False flag is dropped: off
             shutil.which = lambda name: None
-            assert json.loads(cli(["status", "gem"])) == {"id": "gem", "kind": "gemini", "installed": False, "loggedIn": False}
+            assert json.loads(cli(["status", "codex1"])) == {"id": "codex1", "kind": "codex", "installed": False, "loggedIn": False}
             try:
                 cli(["add", "codex", "missing"])
                 raise AssertionError("Missing npm accepted")
@@ -1950,26 +2297,20 @@ def selftest():
                 except SystemExit as e:
                     assert str(e) == "taken is already set up."
             assert load()["accounts"] == [concurrent]
-            job = {}
-            assert cli_reply("gemini", '{"response":"done","stats":{"models":{"flash":{"tokens":{"total":12}}}}}', "", job) == ("done", "")
-            assert job == {"tokens": 12}
-            assert cli_reply("gemini", '{"error":{"message":"API key not valid"}}', "", {}) == ("", "API key not valid")
             assert AUTH.search("API key not valid")
             mcp_real = {k: g[k] for k in ("load", "session_mcp", "with_auth", "mcp_rules")}
             try:
-                g.update(load=lambda: {"accounts": [{"id": "gem", "kind": "gemini", "paid": True}, {"id": "ag", "kind": "antigravity", "paid": True}]},
+                g.update(load=lambda: {"accounts": [{"id": "ag", "kind": "antigravity", "paid": True}]},
                          session_mcp=lambda cwd: {"test": {}}, with_auth=lambda servers: (servers, []),
                          mcp_rules=lambda servers, cwd=None: ([], [], [], {}))
-                assert brief("look", "search", None, None, None, ".", ["test"]) == "Gemini and Antigravity delegates do not take MCP servers yet."
+                assert brief("look", "search", None, None, None, ".", ["test"]) == "Antigravity delegates do not take MCP servers yet."
             finally:
                 g.update(mcp_real)
     finally:
         g.update(real)
-        shutil.which, subprocess.run, sys.stdin = saved_which, saved_run, saved_stdin
-        if saved_key is None:
-            os.environ.pop("GEMINI_API_KEY", None)
-        else:
-            os.environ["GEMINI_API_KEY"] = saved_key
+        shutil.which, subprocess.run, sys.stdin, urllib.request.urlopen = saved_which, saved_run, saved_stdin, saved_urlopen
+        for k, v in saved_keys.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
     tmp = DIR / "selftest-transcript.jsonl"
     DIR.mkdir(exist_ok=True)
     tmp.write_text("\n".join(json.dumps(e) for e in [
@@ -2326,7 +2667,7 @@ def selftest():
             wr.close()
         g.update(real)
     # A failed provider goes last; a timed-out try moves up to heavy: a strong account and 20 minutes.
-    real = {k: g[k] for k in ("run_cli", "load", "save", "log_job", "run_check", "touched")}
+    real = {k: g[k] for k in ("run_cli", "load", "save", "log_job", "run_check", "touched", "catalog")}
     accounts = [{"id": "o1", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"}, {"id": "o2", "kind": "opencode", "model": "opencode/glm-5.3-flash-free"},
                 {"id": "x", "kind": "codex"}, {"id": "c", "kind": "claude"}]
     tries, replies = [], []
@@ -2375,6 +2716,16 @@ def selftest():
                 assert accounts[0]["bench_reason"] == "errors", accounts
             else:
                 assert "exhausted_until" not in accounts[0], accounts
+        # An api try adds its own cost to the account's spend, not the job's total from earlier tries; at the limit it leaves the pool.
+        g["catalog"] = lambda: {"prov": {"env": ["FRUGALTEST_PROV_KEY"]}}
+        accounts[:] = [{"id": "ap", "kind": "api", "provider": "prov", "model": "prov/m", "data_dir": "/d", "spend_limit": 0.5, "spend_period": "day"}]
+        step = '{"part":{"type":"step-finish","cost":0.25,"tokens":{"total":10}}}\n{"part":{"type":"text","text":"ok"}}'
+        tries.clear()
+        for usd in (0.25, 0.5):
+            job, replies[:] = {"cost": 1.0}, [(0, step, "")]
+            assert brief("look", "search", None, "standard", None, ".", job=job).startswith("Done by ap") and job["cost"] == 1.25, job
+            assert accounts[0]["spend"] == {"since": today(), "usd": usd} and tries[-1][0] == "opencode", accounts
+        assert brief("look", "search", None, "standard", None, ".").startswith("frugal: no secondary account can take this (ap over its spend limit)")
     finally:
         g.update(real)
     return "selftest ok"
