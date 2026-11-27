@@ -1688,7 +1688,20 @@ def login(a):
     if argv and os.name != "nt":
         # frugal: no terminal is opened outside Windows; run login in-process with the user's tty when one is asked for.
         return f"Run in a terminal: {' '.join(f'{k}={v}' for k, v in env.items())} {cmd}, then: login {a['id']}".strip()
-    if argv:
+    if a["kind"] == "antigravity":
+        # agy has no login command: it signs in, then stays in its TUI. Close it once the token appears; "exit 0" closes Windows Terminal tabs too.
+        token = Path(a["home"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        before = token.stat().st_mtime if token.is_file() else None
+        p = subprocess.Popen(f'cmd /d /c "title frugal login {a["id"]}& {cmd}& exit 0"', env={**os.environ, **env},
+                             creationflags=subprocess.CREATE_NEW_CONSOLE)  # no std handles: the window gets its own, never the MCP pipes
+        while p.poll() is None:
+            time.sleep(1)
+            if token.is_file() and token.stat().st_size and token.stat().st_mtime != before:
+                time.sleep(2)  # let agy finish writing the token
+                subprocess.run(["powershell", "-NoProfile", "-Command", f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={p.pid}' | "
+                                "ForEach-Object { taskkill /T /F /PID $_.ProcessId }"], stdin=subprocess.DEVNULL, capture_output=True)
+                p.wait()
+    elif argv:
         sets = "".join(f'set "{k}={v}" && ' for k, v in env.items())
         subprocess.run(f'start "frugal login {a["id"]}" /wait cmd /c "{sets}{cmd}"', shell=True)
     ok, email = logged_in(a)
