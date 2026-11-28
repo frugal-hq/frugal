@@ -1,5 +1,5 @@
 #!/bin/sh
-# Denies a Read of this plugin's code.md once session-count.sh has pasted it since the last compaction:
+# Denies a Read of this plugin's code.md once session_count.py has pasted it since the last compaction:
 # Haiku re-read it in 15 of 48 bench runs (Sonnet in none), and the copy is re-sent on every later call.
 input=$(cat)
 norm() { tr '\\' '/' | sed 's#//*#/#g; s#/$##' | tr 'A-Z' 'a-z'; }

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-count.sh\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/session_count.py\"",
             "timeout": 10
           },
           {
