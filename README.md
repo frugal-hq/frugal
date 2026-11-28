@@ -5,7 +5,7 @@
 
 # frugal
 
-[![Version](https://img.shields.io/badge/version-0.31.0-blue)](#versions)
+[![Version](https://img.shields.io/badge/version-0.33.0-blue)](#versions)
 [![License: MIT](https://img.shields.io/github/license/frugal-hq/frugal)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](#install)
 
@@ -89,6 +89,8 @@ frugal 0.29.0 (2026-11-20, 39 tasks, 2 runs each) cost 2.4% less than plain Clau
 Every number comes from headless Claude Code runs, checked automatically, with all arms in the same batch. Methods, per-task tables, and how to reproduce them are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Versions
+
+- **0.33.0**: The first code prompt gets a codebase map with the code rules (top-level names per folder, up to 2,000 characters, in projects of 8 or more files), so reuse costs no search; a change scoped to a named function or file gets the short `code-lite.md` instead of `code.md`. `code.md` and `SKILL.md` are shorter, with a rule for vague requests ("build me X": the smallest version that does the core job), and a new `plan` module covers new end-user apps whose features are unstated. The session hook moved from `sh` to Python. Delegation budgets no longer reset when a background task finishes, so sessions with many background runs get their delegate notes and stops. On ponytail's 39 tasks, frugal now costs 2.5% less than ponytail on Sonnet 5.5 and 12.1% less on Haiku 4.5, with equal or better correctness.
 
 - **0.32.0**: API key accounts. `add api <id> <provider> <model>` takes a pay-per-token key on stdin for any provider in the models.dev catalog (`providers` lists them with prices) and runs it through OpenCode. An optional `--limit <usd> <day|week|month|quarter|year>` (or `limit <id> ...` later) stops delegating to it once its spend in the period reaches the limit; API keys take light and standard work after free accounts. The Gemini CLI kind is gone: existing Gemini accounts become API key accounts on provider `google`, and `--paid` marks a Google key with billing on. Model training is allowed per account: `training off|all|some <id>...` replaces `opencode-training`, which stays as an alias.
 - **0.31.2**: Delegates are picked by rank. The recommended rank sorts accounts by their success over the last 30 days of `jobs.jsonl`, then by kind (Codex, Grok, Claude, Antigravity, Gemini, OpenCode); a custom rank, set in Frugal Deck as `order_mode` and `order` in `accounts.json`, puts the user's order first. Work still spreads across idle accounts, but each account's use today counts more the lower it ranks, so higher-ranked accounts take more of it. With the recommended rank, Grok still takes light and standard work last, since it is paid. `ranking` prints the order with each account's tries and success rate.
