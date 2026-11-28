@@ -1374,7 +1374,9 @@ def opencode_tip():
 
 
 def hook_prompt(event):
-    if os.environ.get(DELEGATED):
+    # A background task's completion arrives as a prompt too: resetting the per-prompt counts there let long benchmark
+    # sessions (dozens of background runs) stay under every budget, so their notes and denials never fired.
+    if os.environ.get(DELEGATED) or "<task-notification>" in event.get("prompt", ""):
         return ""
     if (m := re.match(r"\s*/frugal:heads-up\b(.*)", event.get("prompt", ""), re.S)):
         return heads_up_set(event.get("session_id", ""), m.group(1))
@@ -2452,6 +2454,8 @@ def selftest():
         assert gate({**ev, "tool_input": {"file_path": "C:\\Users\\u\\.claude-x\\projects\\p\\memory\\m.md"}}) == (None, None)
         assert gate({**ev, "tool_input": {"file_path": "C:\\Users\\u\\AppData\\Local\\Temp\\claude\\a\\b\\scratchpad\\t.js"}}) == (None, None)
         assert 'in "task"' in gate(ev)[0]
+        state(sid).write_text(json.dumps({"shell": 7}), encoding="utf-8")
+        assert hook_prompt({"session_id": sid, "prompt": "<task-notification>x</task-notification>"}) == "" and read_state(sid)["shell"] == 7
         # Agent: the same brief is sent back twice, the third goes through
         ag = {"session_id": sid, "tool_name": "Agent", "tool_input": {"prompt": "p"}}
         assert '"mcp"' in gate(ag)[0] and "third time" in gate(ag)[0] and gate(ag) == (None, None)
