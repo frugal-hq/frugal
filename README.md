@@ -80,6 +80,8 @@ With an account set up, the `delegate` tool sends each task to the least-used ac
   <img src="docs/charts/cost-0.18.4-light.svg" alt="frugal 0.18.4 feature work cost with the other arm at 100: against no plugins, Haiku 4.5 93.4, Sonnet 5.5 86.9, Opus 5.5 61.8; against ponytail 5.2.0, Haiku 4.5 91.7, Sonnet 5.5 94.2, Opus 5.5 93.8" width="720">
 </picture>
 
+frugal 0.33.0 against ponytail 5.3.3 (2026-11-27 and 28, 39 tasks, 2 runs each): 6.2% cheaper on Haiku, 2.1% on Sonnet and 1.1% on Opus, and every 90% interval crosses zero, so on cost the two are level. frugal failed no correctness check on any model; ponytail failed `vibe-rename` twice on Haiku, and each missed one Haiku safety check. frugal stays ahead on template features (4 to 25% cheaper); on open-ended tasks and fixes the two cost about the same and ponytail writes slightly less code.
+
 On ponytail's own harness (39 tasks, 3 runs each), frugal 0.18.4 passed every check on all three models. It cost 38% less than plain Claude Code on Opus and 5.8 to 8.3% less than ponytail 5.2.0 on every model. Plain Claude Code missed checks on Haiku in 10 of 117 runs.
 
 frugal 0.29.0 (2026-11-20, 39 tasks, 2 runs each) cost 2.4% less than plain Claude Code on Haiku and 4.5% less on Sonnet, with half the lines; on Haiku it missed 2 checks in 78 runs against 4 for plain Claude Code. The gap narrowed since 0.18.4 mostly because plain Claude Code got cheaper (22% on Sonnet).

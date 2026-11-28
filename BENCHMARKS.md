@@ -21,6 +21,43 @@ Costs are the `total_cost_usd` Claude Code reports.
 
 ## Current batches
 
+### Head-to-head: frugal 0.33.0 against ponytail 5.3.3, three models
+
+ponytail's harness, all 39 tasks, n=2, 156 cells per model, both arms in one batch per model (Claude Code 2.1.332; Haiku and Sonnet 2026-11-27, Opus 2026-11-27 to 28; Haiku $8.38, Sonnet $9.76, Opus $24.25). ponytail ran 5.3.3 in its default `full` mode. Cost is the mean per run; "vs ponytail" is the geometric mean of the per-task cost ratio with a 90% bootstrap interval over tasks:
+
+| Model | Arm | Correct | Safe | Lines (median) | Lines (mean) | USD per run | vs ponytail | Cheaper on |
+|---|---|---|---|---|---|---|---|---|
+| Haiku 4.5 | frugal | **1.000** | 0.987 | 27.5 | **50.2** | 0.0502 | -6.2% (-13.4% to +1.4%) | 23 of 39 tasks |
+| | ponytail | 0.974 | 0.987 | 26 | 55.8 | 0.0572 | 0% | |
+| Sonnet 5.5 | frugal | 1.000 | 1.000 | 29 | 40.9 | 0.0618 | -2.1% (-4.6% to +0.4%) | 22 of 39 |
+| | ponytail | 1.000 | 1.000 | 31 | 37.9 | 0.0634 | 0% | |
+| Opus 5.5 | frugal | 1.000 | 1.000 | 33.5 | 47.9 | 0.1536 | -1.1% (-3.4% to +1.4%) | 19 of 39 |
+| | ponytail | 1.000 | 1.000 | 33.5 | 45.2 | 0.1573 | 0% | |
+
+Every interval crosses zero. On cost the two plugins are level on Sonnet and Opus; frugal leads on Haiku, but not significantly.
+
+Cost vs ponytail and mean code lines (frugal / ponytail) by task group:
+
+| Model | Open-ended (15) | Template features (12) | Fixes, security, reuse (12) |
+|---|---|---|---|
+| Haiku 4.5 | +1.1%, 42.1 / 40.3 | **-25.1%**, 92.1 / 114.5 | +6.8%, 18.4 / 16.5 |
+| Sonnet 5.5 | +2.1%, 51.2 / 45.0 | **-8.2%**, 48.3 / 49.9 | -0.8%, 20.7 / 17.1 |
+| Opus 5.5 | -0.4%, 62.3 / 57.5 | **-4.3%**, 55.2 / 54.9 | +1.3%, 22.7 / 20.1 |
+
+frugal is cheaper on the template tasks on every model, because it takes fewer turns (5.3 against 6.6 per run on Haiku, 3.4 against 4.3 on Sonnet, 4.4 against 5.1 on Opus). On open-ended tasks and fixes the two cost about the same, and frugal writes a few more lines. On Opus most of a run's cost is Claude Code's own context, about 12,600 cache-write tokens per run that both arms pay, so frugal's smaller reads and output barely move the total.
+
+On Haiku both arms missed `trace-transfer` safety once, and ponytail failed `vibe-rename` in 2 of 2 runs. Sonnet and Opus missed nothing.
+
+Haiku and Sonnet ran before a fix to `SKILL.md` and `code-lite.md`. In 3 of 78 runs Haiku had looked for `billing.py` in the skill's base directory instead of the working directory, which put `trace-amount` at +177% against ponytail. With the fix, a Haiku rerun of four tasks (`auth-token`, `reuse-money`, `trace-amount`, `trace-transfer`, n=2) read no plugin files and came out -8.3% against ponytail (-22.8% to +9.4%), with 7 of 8 runs safe against 6 of 8. Opus ran the fixed version.
+
+core8 overstates the lead. On Opus it gave -5.0% against -1.1% over all 39 tasks, on Sonnet -7.2% against -2.1%, on Haiku -17.3% against -6.2%. Cost claims here come from the full 39 tasks; core8 is for checking behavior.
+
+The Opus core8 batch also ran plain Claude Code (n=2): 0.2768 USD per run, against 0.1341 for frugal (-41.6%, -59.3% to -17.2%) and 0.1418 for ponytail (-38.5%). Plain Claude Code failed `vibe-jsonconf` once and wrote 509 lines on `tmpl-fe-datepicker` and 422 on `vibe-rename`, where both plugins wrote 20 to 52. The first 16 cells of that batch ran on another account, hit its usage limit, and the batch was finished with `--resume`; the account does not change `total_cost_usd`.
+
+Against ponytail 5.2.0, frugal 0.18.4 was 8.3% cheaper on Haiku, 5.8% on Sonnet and 6.2% on Opus. The lead shrank on every model, but those batches ran 3 runs per cell on an older Claude Code, so the comparison is loose.
+
+**Two code.md changes tried and dropped** (2026-11-28, 10 open-ended and 2 template tasks, n=3, Haiku and Sonnet, 0.33.0 and the variant in one batch, $7.38). One put checks in a `_test()` function instead of loose under `if __name__ == "__main__":`; the other allowed one input path, `sys.argv` or the prompt the task implies, never both unasked. Every run passed every check. Source lines fell (Sonnet mean 51.2 to 40.7) but test lines rose by about as much (1.2 to 13.7), and cost went up 1.5% on Haiku and 3.5% on Sonnet, so neither change shipped.
+
 ### frugal 0.29.0 against no plugins, Haiku 4.5 and Sonnet 5.5
 
 ponytail's harness, all 39 tasks, n=2, 156 cells per model, both arms in one batch per model (2026-11-20, Claude Code 2.1.329; Haiku $8.68, Sonnet $11.12). Cost is the mean per run; "vs no plugins" is the geometric mean of the per-task cost ratio with a 90% bootstrap interval:
