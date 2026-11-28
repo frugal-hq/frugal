@@ -537,8 +537,14 @@ def score_todo(workdir):
         data = raw.encode() if raw is not None else (_json.dumps(body).encode() if body is not None else None)
         r = urllib.request.Request(base + path, data=data, method=method,
                                    headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=4) as resp:
-            return resp.status, resp.read().decode()
+        for i in range(3):   # Windows resets a fresh connection now and then (WinError 10054) with the server still up
+            try:
+                with urllib.request.urlopen(r, timeout=15) as resp:  # room for a box loaded by parallel cells
+                    return resp.status, resp.read().decode()
+            except urllib.error.HTTPError: raise
+            except (ConnectionResetError, urllib.error.URLError):
+                if i == 2: raise
+                time.sleep(0.2)
     env = {**os.environ, "PORT": str(port)}
     proc = subprocess.Popen([node, str(srv)], cwd=str(workdir), env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

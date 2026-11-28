@@ -40,7 +40,6 @@ ARMS = {
     "caveman":        lambda: _skill("benchmarks/arms/caveman-SKILL.md"),
     "frugal":         lambda: None,                  # plugin arm, see PLUGIN_ARMS
     "frugalv":        lambda: None,                  # frugal variant from FRUGALV_PLUGIN_DIR
-    "ponytail+caveman": lambda: None,                # both plugins loaded together
     "yagni":          lambda: "Follow YAGNI principles.",
     "yagni-oneliner": lambda: "Follow YAGNI principles, and prefer one-liner solutions.",
 }
@@ -67,9 +66,8 @@ def _plugin_dir(name):
     return str(versions[-1])                    # latest version dir; not pinned to one machine's hash
 
 def _plugins(arm):
-    """Plugin names an arm loads: "ponytail+caveman" -> both; [] for a prompt arm."""
-    names = arm.split("+")
-    return names if all(n in PLUGIN_ARMS for n in names) else []
+    """Plugin names an arm loads; [] for a prompt arm."""
+    return [arm] if arm in PLUGIN_ARMS else []
 
 LIMIT_WAIT, LIMIT_TRIES = 600, 48   # session limit hit: retry the cell every 10 min, up to 8h
 
@@ -271,11 +269,13 @@ def _selftest_plugin_dir():
     fails loudly (sys.exit) instead of silently passing a non-existent path to --plugin-dir."""
     fails = 0
     sentinel = "/tmp/ponytail-selftest-plugin-dir"
+    prev = os.environ.get("PONYTAIL_PLUGIN_DIR")   # the run's own override must survive the selftest
     os.environ["PONYTAIL_PLUGIN_DIR"] = sentinel
     try:
         ok_env = _plugin_dir("ponytail") == sentinel
     finally:
-        del os.environ["PONYTAIL_PLUGIN_DIR"]
+        if prev is None: del os.environ["PONYTAIL_PLUGIN_DIR"]
+        else: os.environ["PONYTAIL_PLUGIN_DIR"] = prev
     print(f"{'ok ' if ok_env else 'XX '} plugin_dir   env  override honored")
     fails += 0 if ok_env else 1
     missing = "ponytail-does-not-exist-xyz"          # no env, no cache entry -> must sys.exit
@@ -398,7 +398,8 @@ def run_cell(task_id, arm, model, workdir: Path):
     # tree -- never a blanket kill, which would also take down this Claude Code session.
     try:
         with open(out_path, "wb") as so, open(err_path, "wb") as se:
-            env = {**os.environ, "CAVEMAN_DEFAULT_MODE": "full", "PONYTAIL_DEFAULT_MODE": "full"}  # upstream defaults
+            env = {**os.environ, "CAVEMAN_DEFAULT_MODE": "full", "PONYTAIL_DEFAULT_MODE": "full",  # upstream defaults
+                   "FRUGAL_DELEGATED": "1"}  # frugal: measure frugal without the user's secondary accounts (their hooks would steer to a delegate tool --strict-mcp-config removes)
             proc = subprocess.Popen(cmd, cwd=str(workdir), stdout=so, stderr=se, env=env,
                                     start_new_session=(os.name != "nt"))
             try:
